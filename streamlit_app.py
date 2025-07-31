@@ -94,15 +94,7 @@ with col4:
         end_date = "N/A"
     st.metric("종료일", end_date)
 
-# 컬럼 정보
-st.subheader("📋 컬럼 정보")
-col_info = pd.DataFrame({
-    '컬럼명': data.columns,
-    '데이터 타입': data.dtypes,
-    '결측값 수': data.isnull().sum(),
-    '고유값 수': [data[col].nunique() for col in data.columns]
-})
-st.dataframe(col_info, use_container_width=True)
+
 
 # 데이터 편집 탭
 tab1, tab2, tab3 = st.tabs(["📊 데이터 미리보기", "✏️ 데이터 편집", "📈 통계 정보"])
@@ -293,16 +285,17 @@ X_min_train, X_min_test, y_min_train, y_min_test = train_test_split(
 )
 
 # 변수 정보 표시
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("📈 최대수요 모델 변수")
-    st.write(f"특징 변수: {len(features_max)}개")
-    st.dataframe(pd.DataFrame({'변수명': features_max}))
-    
-with col2:
-    st.subheader("📉 최저수요 모델 변수")
-    st.write(f"특징 변수: {len(features_min)}개")
-    st.dataframe(pd.DataFrame({'변수명': features_min}))
+st.subheader("📈 최대수요 모델 변수")
+st.write(f"특징 변수: {len(features_max)}개")
+# 헤더 행을 사용한 한 줄 표
+max_vars_df = pd.DataFrame([features_max], columns=[f'변수{i+1}' for i in range(len(features_max))])
+st.dataframe(max_vars_df, use_container_width=True)
+
+st.subheader("📉 최저수요 모델 변수")
+st.write(f"특징 변수: {len(features_min)}개")
+# 헤더 행을 사용한 한 줄 표
+min_vars_df = pd.DataFrame([features_min], columns=[f'변수{i+1}' for i in range(len(features_min))])
+st.dataframe(min_vars_df, use_container_width=True)
 
 st.markdown("---")
 
@@ -479,5 +472,29 @@ if predict_button:
     except Exception as e:
         st.error(f"❌ 예측 중 오류가 발생했습니다: {str(e)}")
         st.info("모델 학습이 완료되지 않았거나 입력 데이터에 문제가 있을 수 있습니다.")
+
+st.markdown("---")
+
+# --- 7. 관련 링크 ---
+st.header("🔗 관련 링크")
+st.info("전력 수요 예측 검증에 사용수 있는 데이터 소스입니다.")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("🌤️ 기상청 기상자료개방포털")
+    st.write("기온, 습도 등 기상 데이터를 제공합니다.")
+    st.markdown(
+        "[기상청 기상자료개방포털 바로가기](https://data.kma.go.kr/stcs/grnd/grndTaList.do?pgmNo=70)",
+        help="기상청에서 제공하는 기상 관측 데이터를 확인할 수 있습니다."
+    )
+
+with col2:
+    st.subheader("⚡ 한국전력거래소")
+    st.write("실시간 전력 수요 및 공급 현황을 확인할 수 있습니다.")
+    st.markdown(
+        "[한국전력거래소 바로가기](https://www.kpx.or.kr/powerinfoSubmain.es?mid=a10606030000)",
+        help="한국전력거래소에서 제공하는 전력 수요 정보를 확인할 수 있습니다."
+    )
 
 st.markdown("---")
