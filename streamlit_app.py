@@ -266,7 +266,7 @@ y_max = data_processed['최대수요']
 
 # [최저수요 모델]
 features_min = [
-    '최저기온', '월', '어제의_최저수요'
+    '최저기온', '평균기온', '월', '어제의_최저수요'
 ] + [col for col in data_processed if '요일_' in col or '평일_' in col]
 X_min = data_processed[features_min]
 y_min = data_processed['최저수요']
@@ -399,6 +399,7 @@ if predict_button:
             # 최저수요 예측을 위한 특징 생성
             min_features = {
                 '최저기온': avg_temp - 5,  # 평균기온 - 5도로 추정
+                '평균기온': avg_temp,
                 '월': selected_month,
                 '어제의_최저수요': 30000  # 기본값 (실제로는 이전 데이터 필요)
             }
