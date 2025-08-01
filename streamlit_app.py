@@ -62,11 +62,6 @@ def setup_google_sheets():
             
     except KeyError:
         st.error("❌ Streamlit Secrets에 'GOOGLE_CREDENTIALS_JSON'이 설정되지 않았습니다.")
-        st.info("""
-        **Secrets 설정 방법:**
-        1. Streamlit Community Cloud 앱의 'Settings'로 이동하세요.
-        2. 'Secrets' 탭에서 `GOOGLE_CREDENTIALS_JSON = """..."""` 형식으로 전체 JSON 내용을 붙여넣어야 합니다.
-        """)
         return None
     except json.JSONDecodeError:
         st.error("❌ Secrets에 저장된 GOOGLE_CREDENTIALS_JSON 값이 올바른 JSON 형식이 아닙니다.")
