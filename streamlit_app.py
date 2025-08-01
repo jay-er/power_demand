@@ -561,15 +561,8 @@ with tab1:
     display_data = data.copy()
     if '날짜' in display_data.columns:
         try:
-            # 이미 문자열인 경우 그대로 사용, 아니면 변환
-            if display_data['날짜'].dtype == 'object':
-                # 이미 YYYY-MM-DD 형식인지 확인
-                sample_date = display_data['날짜'].iloc[0] if len(display_data) > 0 else ''
-                if isinstance(sample_date, str) and len(sample_date) == 10 and '-' in sample_date:
-                    pass  # 이미 올바른 형식
-                else:
-                    # datetime으로 변환 후 년월일까지만 표시
-                    display_data['날짜'] = pd.to_datetime(display_data['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
+            # datetime으로 변환 후 년월일까지만 표시
+            display_data['날짜'] = pd.to_datetime(display_data['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
         except Exception as e:
             st.warning(f"날짜 표시 변환 중 오류: {e}")
     
@@ -586,21 +579,13 @@ with tab1:
 
 with tab2:
     st.subheader("데이터 편집")
-    st.info("아래에서 데이터를 직접 편집할 수 있습니다. 편집 후 '변경사항 적용' 버튼을 클릭하세요.")
-    
+    st.info("아래에서 데이터를 직접 편집하거나 구글시트에서 편집할 수 있습니다. 편집 후 '변경사항 적용' 버튼을 클릭하세요.")
     # 편집용 데이터 준비 (날짜는 년월일까지만 표시)
     edit_data = data.copy()
     if '날짜' in edit_data.columns:
         try:
-            # 이미 문자열인 경우 그대로 사용, 아니면 변환
-            if edit_data['날짜'].dtype == 'object':
-                # 이미 YYYY-MM-DD 형식인지 확인
-                sample_date = edit_data['날짜'].iloc[0] if len(edit_data) > 0 else ''
-                if isinstance(sample_date, str) and len(sample_date) == 10 and '-' in sample_date:
-                    pass  # 이미 올바른 형식
-                else:
-                    # datetime으로 변환 후 년월일까지만 표시
-                    edit_data['날짜'] = pd.to_datetime(edit_data['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
+            # datetime으로 변환 후 년월일까지만 표시
+            edit_data['날짜'] = pd.to_datetime(edit_data['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
         except Exception as e:
             st.warning(f"날짜 편집 변환 중 오류: {e}")
     
@@ -680,6 +665,10 @@ with tab2:
         
         with col2:
             st.success("✅ 구글 시트가 자동으로 업데이트됩니다!")
+    
+    # 원본 구글시트 주소
+    st.subheader("📊 원본 구글시트")
+    st.markdown("[🔗 전력 수요 예측 데이터 바로 가기](https://docs.google.com/spreadsheets/d/1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4/edit?gid=0#gid=0)")
 
 with tab3:
     st.subheader("데이터 통계 정보")

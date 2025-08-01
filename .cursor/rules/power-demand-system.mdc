@@ -1,0 +1,140 @@
+# 전력 수요 예측 시스템 - 기술 스택 & 기능 가이드
+
+## 🏗️ 프로젝트 구조
+
+### 메인 파일
+- [streamlit_app.py](mdc:streamlit_app.py) - 메인 Streamlit 애플리케이션
+- [requirements.txt](mdc:requirements.txt) - Python 의존성 패키지
+- [README.md](mdc:README.md) - 프로젝트 설명서
+
+### 설정 파일
+- [.streamlit/secrets.toml](mdc:.streamlit/secrets.toml) - Streamlit Cloud 배포용 시크릿 설정
+- [.gitignore](mdc:.gitignore) - Git 무시 파일 설정
+
+## 🛠️ 기술 스택
+
+### Frontend & UI
+- **Streamlit** - 웹 애플리케이션 프레임워크
+- **Plotly** - 인터랙티브 차트 및 시각화
+- **Pandas** - 데이터 처리 및 조작
+
+### Backend & Data Processing
+- **Python 3.x** - 메인 프로그래밍 언어
+- **Scikit-learn** - 머신러닝 모델 (RandomForestRegressor)
+- **Pandas** - 데이터 분석 및 처리
+- **NumPy** - 수치 계산
+
+### Cloud & External Services
+- **Google Sheets API** - 데이터 저장 및 동기화
+- **gspread** - Google Sheets Python 라이브러리
+- **Google OAuth2** - 서비스 계정 인증
+
+### Deployment
+- **Streamlit Cloud** - 클라우드 배포 플랫폼
+- **Google Cloud Platform** - 서비스 계정 및 API 관리
+
+## 🔧 주요 기능
+
+### 1. 데이터 관리
+- **자동 데이터 로딩**: 앱 시작 시 Google Sheets에서 자동 데이터 로드
+- **실시간 편집**: Streamlit Data Editor를 통한 인라인 데이터 편집
+- **변경 감지**: 수정된 부분만 Google Sheets에 업데이트
+- **데이터 내보내기**: CSV, Excel 형식으로 데이터 다운로드
+
+### 2. 머신러닝 예측
+- **Random Forest 모델**: 전력 수요 예측
+- **자동 모델 훈련**: 데이터 변경 시 자동 재훈련
+- **성능 평가**: MAE, R² 점수로 모델 성능 측정
+- **예측 시각화**: Plotly를 통한 인터랙티브 차트
+
+### 3. 시각화
+- **데이터 미리보기**: 전체 데이터 테이블 표시
+- **통계 정보**: 수치형/범주형 데이터 통계
+- **예측 결과 차트**: 실제값 vs 예측값 비교
+- **성능 메트릭**: 모델 성능 지표 시각화
+
+### 4. Google Sheets 연동
+- **서비스 계정 인증**: Google Cloud 서비스 계정 사용
+- **자동 동기화**: 편집된 데이터 자동 저장
+- **변경 감지**: 수정된 행만 효율적으로 업데이트
+- **에러 처리**: API 한도 초과 등 예외 상황 처리
+
+## 🔐 보안 & 인증
+
+### Google Sheets 인증 방식
+1. **Streamlit Secrets** (우선순위): `.streamlit/secrets.toml`에서 JSON 키 읽기
+2. **로컬 JSON 파일**: `new-service-account-key.json` 파일 사용
+3. **환경변수**: `GOOGLE_CREDENTIALS_JSON` 환경변수 사용
+
+### 서비스 계정 설정
+- **프로젝트 ID**: `flash-zenith-453703-p6`
+- **서비스 계정**: `power-supply@flash-zenith-453703-p6.iam.gserviceaccount.com`
+- **구글 시트 ID**: `1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4`
+
+## 📊 데이터 구조
+
+### 필수 컬럼
+- **날짜**: 예측을 위한 시간 정보
+- **전력 수요**: 예측 대상 값
+- **기상 데이터**: 온도, 습도 등 예측 변수
+
+### 데이터 처리
+- **자동 타입 변환**: 날짜 컬럼 자동 datetime 변환
+- **결측값 처리**: 빈 값 처리 로직
+- **데이터 검증**: 필수 필드 존재 여부 확인
+
+## 🚀 배포 가이드
+
+### Streamlit Cloud 배포
+1. **Secrets 설정**: Streamlit Cloud 대시보드에서 `GOOGLE_CREDENTIALS_JSON` 설정
+2. **GitHub 연동**: GitHub 저장소와 연결
+3. **자동 배포**: 코드 변경 시 자동 재배포
+
+### 로컬 개발
+1. **의존성 설치**: `pip install -r requirements.txt`
+2. **환경변수 설정**: `.env` 파일 또는 환경변수 설정
+3. **실행**: `streamlit run streamlit_app.py`
+
+## 🔄 코드 패턴
+
+### 데이터 로딩 패턴
+```python
+# 자동 데이터 로딩
+if 'data' not in st.session_state:
+    data = load_data_from_sheet(client, sheet_name, sheet_id)
+    st.session_state.data = data
+```
+
+### 변경 감지 패턴
+```python
+# 변경된 부분만 업데이트
+if original_data is not None:
+    changed_rows = detect_changes(data, original_data)
+    update_only_changed_rows(sheet, changed_rows)
+```
+
+### 모델 훈련 패턴
+```python
+# 자동 모델 재훈련
+if st.session_state.data_updated:
+    model = train_model(X_train, y_train)
+    evaluate_model(model, X_test, y_test)
+```
+
+## 🐛 디버깅 가이드
+
+### 일반적인 오류
+1. **PEM 파일 오류**: 서비스 계정 키 형식 문제
+2. **API 한도 초과**: Google Sheets API 호출 제한
+3. **인증 실패**: 서비스 계정 권한 문제
+4. **데이터 형식 오류**: 날짜 컬럼 변환 실패
+
+### 해결 방법
+- **키 재생성**: Google Cloud Console에서 새로운 서비스 계정 키 생성
+- **권한 확인**: 구글 시트에 서비스 계정 이메일 추가
+- **데이터 검증**: 필수 컬럼 존재 여부 확인
+- **로깅 추가**: `st.info()`, `st.error()`로 디버깅 정보 출력
+description:
+globs:
+alwaysApply: false
+---
