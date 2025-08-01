@@ -740,6 +740,158 @@ if predict_button:
         st.error(f"❌ 예측 중 오류가 발생했습니다: {str(e)}")
         st.info("모델 학습이 완료되지 않았거나 입력 데이터에 문제가 있을 수 있습니다.")
 
+# --- 새로운 예측 기능: 최저기온/최고기온 입력 ---
+st.markdown("---")
+st.subheader("🌡️ 상세 기온 기반 예측")
+st.info("최저기온과 최고기온을 직접 입력하여 더 정확한 예측을 수행합니다.")
+
+# 새로운 예측 입력 폼
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("📝 상세 예측 조건 입력")
+    
+    # 요일 선택 (기존과 동일)
+    selected_weekday_detailed = st.selectbox("요일 선택", weekday_options, index=0, key="weekday_detailed")
+    
+    # 최저기온 입력
+    min_temp = st.number_input("최저기온 (°C)", min_value=-50.0, max_value=50.0, value=15.0, step=0.1, key="min_temp")
+    
+    # 최고기온 입력
+    max_temp = st.number_input("최고기온 (°C)", min_value=-50.0, max_value=50.0, value=25.0, step=0.1, key="max_temp")
+    
+    # 월 선택 (계절성 고려)
+    selected_month_detailed = st.selectbox("월 선택", month_options, index=4, key="month_detailed")  # 5월 기본값
+    
+    # 상세 예측 버튼
+    predict_detailed_button = st.button("🔮 상세 예측 실행", type="primary", key="predict_detailed")
+
+with col2:
+    st.subheader("📊 상세 입력 정보")
+    st.write(f"**선택된 요일:** {selected_weekday_detailed}")
+    st.write(f"**최저기온:** {min_temp}°C")
+    st.write(f"**최고기온:** {max_temp}°C")
+    st.write(f"**평균기온:** {(min_temp + max_temp) / 2:.1f}°C")
+    st.write(f"**선택된 월:** {selected_month_detailed}월")
+
+# 상세 예측 실행
+if predict_detailed_button:
+    try:
+        with st.spinner("상세 예측을 수행 중..."):
+            # 평균기온 계산
+            avg_temp_detailed = (min_temp + max_temp) / 2
+            
+            # 요일 원핫 인코딩
+            weekday_dummies_detailed = {}
+            for day in weekday_options:
+                if day == selected_weekday_detailed:
+                    weekday_dummies_detailed[f'요일_{day}'] = 1
+                else:
+                    weekday_dummies_detailed[f'요일_{day}'] = 0
+            
+            # 평일 여부 (주말이면 0, 평일이면 1)
+            is_weekday_detailed = 1 if selected_weekday_detailed in ['월요일', '화요일', '수요일', '목요일', '금요일'] else 0
+            
+            # 평일 원핫 인코딩
+            weekday_dummies_detailed['평일_평일'] = is_weekday_detailed
+            
+            # 최대수요 예측을 위한 특징 생성 (실제 최고기온 사용)
+            max_features_detailed = {
+                '최고기온': max_temp,  # 실제 최고기온 사용
+                '평균기온': avg_temp_detailed,
+                '월': selected_month_detailed,
+                '어제의_최대수요': 50000  # 기본값
+            }
+            max_features_detailed.update(weekday_dummies_detailed)
+            
+            # 최저수요 예측을 위한 특징 생성 (실제 최저기온 사용)
+            min_features_detailed = {
+                '최저기온': min_temp,  # 실제 최저기온 사용
+                '평균기온': avg_temp_detailed,
+                '월': selected_month_detailed,
+                '어제의_최저수요': 30000  # 기본값
+            }
+            min_features_detailed.update(weekday_dummies_detailed)
+            
+            # 특징 순서 맞추기
+            max_input_detailed = pd.DataFrame([max_features_detailed])
+            min_input_detailed = pd.DataFrame([min_features_detailed])
+            
+            # 필요한 컬럼만 선택
+            max_input_detailed = max_input_detailed[features_max]
+            min_input_detailed = min_input_detailed[features_min]
+            
+            # 예측 실행
+            predicted_max_detailed = rf_max.predict(max_input_detailed)[0]
+            predicted_min_detailed = rf_min.predict(min_input_detailed)[0]
+            
+            st.success("✅ 상세 예측 완료!")
+            
+            # 예측 결과 표시
+            st.subheader("🎯 상세 예측 결과")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("예측 최대수요", f"{predicted_max_detailed:,.0f} MW")
+            with col2:
+                st.metric("예측 최저수요", f"{predicted_min_detailed:,.0f} MW")
+            
+            # 예측 결과 상세 정보
+            st.subheader("📋 상세 예측 상세 정보")
+            prediction_info_detailed = pd.DataFrame({
+                '항목': ['요일', '최저기온', '최고기온', '평균기온', '월', '예측 최대수요', '예측 최저수요', '수요 차이'],
+                '값': [selected_weekday_detailed, f"{min_temp}°C", f"{max_temp}°C", f"{avg_temp_detailed:.1f}°C", f"{selected_month_detailed}월", 
+                      f"{predicted_max_detailed:,.0f} MW", f"{predicted_min_detailed:,.0f} MW", 
+                      f"{predicted_max_detailed - predicted_min_detailed:,.0f} MW"]
+            })
+            st.dataframe(prediction_info_detailed, use_container_width=True)
+            
+            # 예측 신뢰도 (모델 성능 기반)
+            confidence_max_detailed = min(95, max(60, st.session_state.r2_max * 100))
+            confidence_min_detailed = min(95, max(60, st.session_state.r2_min * 100))
+            
+            st.subheader("📊 상세 예측 신뢰도")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("최대수요 예측 신뢰도", f"{confidence_max_detailed:.1f}%")
+            with col2:
+                st.metric("최저수요 예측 신뢰도", f"{confidence_min_detailed:.1f}%")
+            
+            # 상세 예측 결과 시각화
+            st.subheader("📈 상세 예측 결과 시각화")
+            
+            fig_prediction_detailed = go.Figure()
+            
+            # 최대수요와 최저수요를 막대 그래프로 표시
+            fig_prediction_detailed.add_trace(go.Bar(
+                x=['최대수요', '최저수요'],
+                y=[predicted_max_detailed, predicted_min_detailed],
+                name='상세 예측 수요',
+                marker_color=['red', 'blue']
+            ))
+            
+            fig_prediction_detailed.update_layout(
+                title=f"{selected_weekday_detailed} (최저:{min_temp}°C, 최고:{max_temp}°C) 전력 수요 예측",
+                yaxis_title="전력 수요 (MW)",
+                showlegend=True
+            )
+            
+            st.plotly_chart(fig_prediction_detailed, use_container_width=True)
+            
+            # 두 예측 방식 비교
+            st.subheader("📊 예측 방식 비교")
+            comparison_data = pd.DataFrame({
+                '예측 방식': ['평균기온 기반', '상세 기온 기반'],
+                '최대수요 예측': [f"{predicted_max:,.0f} MW", f"{predicted_max_detailed:,.0f} MW"],
+                '최저수요 예측': [f"{predicted_min:,.0f} MW", f"{predicted_min_detailed:,.0f} MW"],
+                '수요 차이': [f"{predicted_max - predicted_min:,.0f} MW", f"{predicted_max_detailed - predicted_min_detailed:,.0f} MW"]
+            })
+            st.dataframe(comparison_data, use_container_width=True)
+            
+    except Exception as e:
+        st.error(f"❌ 상세 예측 중 오류가 발생했습니다: {str(e)}")
+        st.info("모델 학습이 완료되지 않았거나 입력 데이터에 문제가 있을 수 있습니다.")
+
 st.markdown("---")
 
 # --- 7. 관련 링크 ---
