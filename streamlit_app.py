@@ -37,26 +37,24 @@ if 'r2_min' not in st.session_state:
 def setup_google_sheets():
     """구글 시트 연결 설정 (st.secrets 사용)"""
     try:
-        # Streamlit Cloud의 Secrets에서 직접 JSON 정보 읽기
-        # st.secrets는 딕셔너리처럼 작동하여 TOML 파일을 자동으로 파싱해줍니다.
         creds_json_str = st.secrets["GOOGLE_CREDENTIALS_JSON"]
         
-        # JSON 문자열을 딕셔너리로 변환
+        # --- 디버깅을 위한 코드 추가 ---
+        st.subheader("🕵️ 디버깅 정보: Secrets 값 확인")
+        st.info("아래 상자에 표시된 내용이 올바른 JSON 형식인지 확인하세요.")
+        st.code(creds_json_str)
+        # --- 디버깅 코드 끝 ---
+        
         credentials_data = json.loads(creds_json_str)
         
-        # 구글 시트 API 스코프 설정
         scope = [
             'https://spreadsheets.google.com/feeds',
             'https://www.googleapis.com/auth/drive'
         ]
-        
-        # 인증 정보 생성
         creds = Credentials.from_service_account_info(
             credentials_data, 
             scopes=scope
         )
-        
-        # gspread 클라이언트 생성
         client = gspread.authorize(creds)
         return client
             
