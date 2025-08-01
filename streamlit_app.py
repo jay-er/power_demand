@@ -9,12 +9,7 @@ from typing import Optional, Dict, Any
 import io
 import gspread
 from google.oauth2.service_account import Credentials
-import os
 import json
-from dotenv import load_dotenv
-
-# .env 파일 로드
-load_dotenv()
 
 # 페이지 설정 (반드시 첫 번째 Streamlit 명령어여야 함)
 st.set_page_config(
@@ -37,30 +32,23 @@ if 'mae_min' not in st.session_state:
 if 'r2_min' not in st.session_state:
     st.session_state.r2_min = None
 
-# 구글 시트 설정
+# --- [수정된 부분 1] ---
+# 구글 시트 설정 함수 수정
 def setup_google_sheets():
-    """구글 시트 연결 설정"""
+    """구글 시트 연결 설정 (st.secrets 사용)"""
     try:
+        # Streamlit Cloud의 Secrets에서 직접 JSON 정보 읽기
+        # st.secrets는 딕셔너리처럼 작동하여 TOML 파일을 자동으로 파싱해줍니다.
+        creds_json_str = st.secrets["GOOGLE_CREDENTIALS_JSON"]
+        
+        # JSON 문자열을 딕셔너리로 변환
+        credentials_data = json.loads(creds_json_str)
+        
         # 구글 시트 API 스코프 설정
         scope = [
             'https://spreadsheets.google.com/feeds',
             'https://www.googleapis.com/auth/drive'
         ]
-        
-        # 환경변수에서 JSON 키 읽기
-        google_credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-        
-        if not google_credentials_json:
-            st.error("❌ 환경변수 GOOGLE_CREDENTIALS_JSON이 설정되지 않았습니다.")
-            st.info("""
-            **환경변수 설정 방법:**
-            1. JSON 키 파일의 내용을 환경변수로 설정
-            2. 또는 .env 파일에 GOOGLE_CREDENTIALS_JSON=파일내용 추가
-            """)
-            return None
-        
-        # JSON 문자열을 딕셔너리로 변환
-        credentials_data = json.loads(google_credentials_json)
         
         # 인증 정보 생성
         creds = Credentials.from_service_account_info(
@@ -72,9 +60,24 @@ def setup_google_sheets():
         client = gspread.authorize(creds)
         return client
             
+    except KeyError:
+        st.error("❌ Streamlit Secrets에 'GOOGLE_CREDENTIALS_JSON'이 설정되지 않았습니다.")
+        st.info("""
+        **Secrets 설정 방법:**
+        1. Streamlit Community Cloud 앱의 'Settings'로 이동하세요.
+        2. 'Secrets' 탭에서 `GOOGLE_CREDENTIALS_JSON = """..."""` 형식으로 전체 JSON 내용을 붙여넣어야 합니다.
+        """)
+        return None
+    except json.JSONDecodeError:
+        st.error("❌ Secrets에 저장된 GOOGLE_CREDENTIALS_JSON 값이 올바른 JSON 형식이 아닙니다.")
+        st.info("값이 `{\"type\": \"service_account\", ...}` 로 시작하는지, 그리고 전체가 `\"\"\"`로 감싸여 있는지 확인하세요.")
+        return None
     except Exception as e:
         st.error(f"❌ 구글 시트 연결 오류: {str(e)}")
+        st.info("서비스 계정 이메일이 구글 시트에 편집자로 공유되었는지 확인하세요.")
         return None
+# --- [수정 완료] ---
+
 
 def load_data_from_sheet(client, sheet_name="power_data", sheet_id=None):
     """구글 시트에서 데이터 로드"""
@@ -239,12 +242,7 @@ st.subheader("🔐 구글 시트 연결 설정")
 client = setup_google_sheets()
 
 if client is None:
-    st.error("❌ 구글 시트 연결에 실패했습니다.")
-    st.info("""
-    **구글 시트 설정 확인:**
-    1. 구글 시트 ID: `1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4`에 접근 가능한지 확인
-    2. 서비스 계정 이메일: `firebase-adminsdk-fbsvc@test-92f50.iam.gserviceaccount.com`이 편집자 권한으로 공유되어 있는지 확인
-    """)
+    st.error("❌ 구글 시트 연결에 실패했습니다. 위의 안내에 따라 설정을 확인해주세요.")
     st.stop()
 else:
     st.success("✅ 구글 시트 연결 성공!")
