@@ -32,44 +32,100 @@ if 'mae_min' not in st.session_state:
 if 'r2_min' not in st.session_state:
     st.session_state.r2_min = None
 
-# --- [수정된 부분 1] ---
-# 구글 시트 설정 함수 수정
 def setup_google_sheets():
-    """구글 시트 연결 설정 (st.secrets 사용)"""
+    """구글 시트 연결 설정 (우선순위: 환경변수 > Streamlit Secrets > JSON 파일)"""
     try:
-        creds_json_str = st.secrets["GOOGLE_CREDENTIALS_JSON"]
+        # 1. 환경 변수에서 인증 정보 로드 (최고 우선순위)
+        import os
+        credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
         
-        # --- 디버깅을 위한 코드 추가 ---
-        st.subheader("🕵️ 디버깅 정보: Secrets 값 확인")
-        st.info("아래 상자에 표시된 내용이 올바른 JSON 형식인지 확인하세요.")
-        st.code(creds_json_str)
-        # --- 디버깅 코드 끝 ---
+        if credentials_json:
+            try:
+                credentials_data = json.loads(credentials_json)
+                # 스코프 설정
+                scope = [
+                    'https://spreadsheets.google.com/feeds',
+                    'https://www.googleapis.com/auth/drive',
+                    'https://www.googleapis.com/auth/spreadsheets'
+                ]
+                
+                # 인증 정보로 Credentials 생성
+                creds = Credentials.from_service_account_info(
+                    credentials_data, 
+                    scopes=scope
+                )
+                
+                # gspread 클라이언트 생성
+                client = gspread.authorize(creds)
+                return client
+                
+            except Exception as e:
+                st.error(f"❌ 환경 변수에서 인증 정보 로드 실패: {str(e)}")
         
-        credentials_data = json.loads(creds_json_str)
+        # 2. Streamlit Secrets에서 인증 정보 로드
+        try:
+            # 다양한 키 이름으로 시도
+            if 'GOOGLE_CREDENTIALS_JSON' in st.secrets:
+                credentials_data = json.loads(st.secrets['GOOGLE_CREDENTIALS_JSON'])
+            elif 'GOOGLE_SERVICE_ACCOUNT_INFO' in st.secrets:
+                credentials_data = st.secrets['GOOGLE_SERVICE_ACCOUNT_INFO']
+            else:
+                raise KeyError("Streamlit Secrets에 인증 정보가 없습니다")
+            
+            # 스코프 설정
+            scope = [
+                'https://spreadsheets.google.com/feeds',
+                'https://www.googleapis.com/auth/drive',
+                'https://www.googleapis.com/auth/spreadsheets'
+            ]
+            
+            # 인증 정보로 Credentials 생성
+            creds = Credentials.from_service_account_info(
+                credentials_data, 
+                scopes=scope
+            )
+            
+            # gspread 클라이언트 생성
+            client = gspread.authorize(creds)
+            return client
+            
+        except Exception as e:
+            st.error(f"❌ Streamlit Secrets에서 인증 정보 로드 실패: {str(e)}")
         
+        # 3. JSON 파일에서 인증 정보 로드 (개발 환경용)
+        json_file_path = "test-92f50-a704ebe1984f.json"
+        
+        if not os.path.exists(json_file_path):
+            st.error(f"❌ JSON 파일을 찾을 수 없습니다: {json_file_path}")
+            return None
+        
+        # JSON 파일 읽기
+        with open(json_file_path, 'r', encoding='utf-8') as f:
+            credentials_data = json.load(f)
+        
+        # 스코프 설정
         scope = [
             'https://spreadsheets.google.com/feeds',
-            'https://www.googleapis.com/auth/drive'
+            'https://www.googleapis.com/auth/drive',
+            'https://www.googleapis.com/auth/spreadsheets'
         ]
+        
+        # 인증 정보로 Credentials 생성
         creds = Credentials.from_service_account_info(
             credentials_data, 
             scopes=scope
         )
+        
+        # gspread 클라이언트 생성
         client = gspread.authorize(creds)
         return client
             
-    except KeyError:
-        st.error("❌ Streamlit Secrets에 'GOOGLE_CREDENTIALS_JSON'이 설정되지 않았습니다.")
-        return None
-    except json.JSONDecodeError:
-        st.error("❌ Secrets에 저장된 GOOGLE_CREDENTIALS_JSON 값이 올바른 JSON 형식이 아닙니다.")
-        st.info("값이 `{\"type\": \"service_account\", ...}` 로 시작하는지, 그리고 전체가 `\"\"\"`로 감싸여 있는지 확인하세요.")
+    except json.JSONDecodeError as e:
+        st.error(f"❌ JSON 파싱 오류: {str(e)}")
         return None
     except Exception as e:
         st.error(f"❌ 구글 시트 연결 오류: {str(e)}")
-        st.info("서비스 계정 이메일이 구글 시트에 편집자로 공유되었는지 확인하세요.")
         return None
-# --- [수정 완료] ---
 
 
 def load_data_from_sheet(client, sheet_name="power_data", sheet_id=None):
@@ -228,39 +284,60 @@ with st.sidebar:
 # --- 0. 데이터 로딩 및 편집 ---
 st.header("📁 Step 0: 데이터 로딩 및 편집")
 
-# 구글 시트 설정
-st.subheader("🔐 구글 시트 연결 설정")
+# 구글 시트 자동 연결
+st.subheader("🔐 구글 시트 자동 연결")
 
 # 구글 시트 클라이언트 설정
 client = setup_google_sheets()
 
 if client is None:
-    st.error("❌ 구글 시트 연결에 실패했습니다. 위의 안내에 따라 설정을 확인해주세요.")
+    st.error("❌ 구글 시트 연결에 실패했습니다.")
+    st.info("""
+    🔧 **해결 방법:**
+    
+    1. **환경 변수 설정**: `GOOGLE_CREDENTIALS_JSON` 환경 변수에 JSON 문자열 설정
+    2. **Streamlit Secrets 설정**: `.streamlit/secrets.toml` 파일에 인증 정보 설정
+    3. **JSON 파일 확인**: `test-92f50-a704ebe1984f.json` 파일이 프로젝트 루트에 있는지 확인
+    4. **구글 시트 공유 설정**: 서비스 계정 이메일과 공유했는지 확인
+    """)
     st.stop()
-else:
-    st.success("✅ 구글 시트 연결 성공!")
 
-# 구글 시트 설정 정보
+st.session_state.google_client = client
+
+# 데이터 자동 로딩
+st.subheader("📊 데이터 자동 로딩")
+
+# 하드코딩된 시트 정보
 sheet_name = "시트1"
 sheet_id = "1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4"
 
-# 데이터 로딩
-if st.button("📊 데이터 로드", type="primary"):
-    with st.spinner("구글 시트에서 데이터를 로딩 중..."):
-        data = load_data_from_sheet(client, sheet_name, sheet_id)
+# 자동으로 데이터 로드
+with st.spinner("구글 시트에서 데이터를 자동 로딩 중..."):
+    data = load_data_from_sheet(client, sheet_name, sheet_id)
+    
+    if data is not None:
+        st.session_state.data = data
+        # 원본 데이터 저장 (변경 감지를 위해)
+        st.session_state.original_data = data.copy()
         
-        if data is not None:
-            st.session_state.data = data
-            # 원본 데이터 저장 (변경 감지를 위해)
-            st.session_state.original_data = data.copy()
-            st.success("✅ 구글 시트에서 데이터 로딩 성공!")
-        else:
-            st.error("❌ 데이터 로딩에 실패했습니다.")
-            st.stop()
+        # 데이터 미리보기
+        with st.expander("📋 로딩된 데이터 미리보기"):
+            st.dataframe(data.head(10), use_container_width=True)
+    else:
+        st.error("❌ 데이터 로딩에 실패했습니다.")
+        st.info("""
+        🔧 **문제 해결 방법:**
+        
+        1. **시트 이름/ID 확인**: 올바른 시트 이름이나 ID를 입력했는지 확인
+        2. **권한 확인**: 서비스 계정이 시트에 접근할 수 있는지 확인
+        3. **데이터 확인**: 시트에 헤더와 데이터가 있는지 확인
+        4. **인증 정보 확인**: 서비스 계정 키가 올바른지 확인
+        """)
+        st.stop()
 
 # 데이터가 로드되었는지 확인
 if 'data' not in st.session_state:
-    st.info("👆 위의 '데이터 로드' 버튼을 클릭하여 구글 시트에서 데이터를 가져오세요.")
+    st.error("❌ 데이터 로딩에 실패했습니다.")
     st.stop()
 
 data = st.session_state.data
