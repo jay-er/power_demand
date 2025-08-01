@@ -6,9 +6,17 @@ from sklearn.metrics import mean_absolute_error, r2_score
 import plotly.express as px
 import plotly.graph_objects as go
 from typing import Optional, Dict, Any
-import io # Added for Excel file saving
+import io
+import gspread
+from google.oauth2.service_account import Credentials
+import os
+import json
+from dotenv import load_dotenv
 
-# 페이지 설정
+# .env 파일 로드
+load_dotenv()
+
+# 페이지 설정 (반드시 첫 번째 Streamlit 명령어여야 함)
 st.set_page_config(
     page_title="전력 수요 예측 시스템",
     page_icon="⚡",
@@ -29,6 +37,180 @@ if 'mae_min' not in st.session_state:
 if 'r2_min' not in st.session_state:
     st.session_state.r2_min = None
 
+# 구글 시트 설정
+def setup_google_sheets():
+    """구글 시트 연결 설정"""
+    try:
+        # 구글 시트 API 스코프 설정
+        scope = [
+            'https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive'
+        ]
+        
+        # 환경변수에서 JSON 키 읽기
+        google_credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+        
+        if not google_credentials_json:
+            st.error("❌ 환경변수 GOOGLE_CREDENTIALS_JSON이 설정되지 않았습니다.")
+            st.info("""
+            **환경변수 설정 방법:**
+            1. JSON 키 파일의 내용을 환경변수로 설정
+            2. 또는 .env 파일에 GOOGLE_CREDENTIALS_JSON=파일내용 추가
+            """)
+            return None
+        
+        # JSON 문자열을 딕셔너리로 변환
+        credentials_data = json.loads(google_credentials_json)
+        
+        # 인증 정보 생성
+        creds = Credentials.from_service_account_info(
+            credentials_data, 
+            scopes=scope
+        )
+        
+        # gspread 클라이언트 생성
+        client = gspread.authorize(creds)
+        return client
+            
+    except Exception as e:
+        st.error(f"❌ 구글 시트 연결 오류: {str(e)}")
+        return None
+
+def load_data_from_sheet(client, sheet_name="power_data", sheet_id=None):
+    """구글 시트에서 데이터 로드"""
+    try:
+        # 시트 열기 (ID가 제공된 경우 ID로, 아니면 이름으로)
+        if sheet_id and sheet_id.strip():
+            sheet = client.open_by_key(sheet_id).sheet1
+        else:
+            sheet = client.open(sheet_name).sheet1
+        
+        # 모든 데이터 가져오기
+        all_values = sheet.get_all_values()
+        
+        if len(all_values) == 0:
+            st.error("❌ 시트에 데이터가 없습니다.")
+            return None
+        
+        # 첫 번째 행을 헤더로 사용
+        headers = all_values[0]
+        data_rows = all_values[1:]
+        
+        # 데이터프레임 생성
+        df = pd.DataFrame(data_rows, columns=headers)
+        
+        # 수치형 컬럼 변환
+        numeric_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '최저수요']
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # 날짜 컬럼을 년월일까지만 표시하도록 변환
+        if '날짜' in df.columns:
+            try:
+                # 날짜 컬럼을 datetime으로 변환 후 년월일까지만 표시
+                df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
+            except Exception as e:
+                st.warning(f"날짜 변환 중 오류: {e}")
+        
+        return df
+    except Exception as e:
+        st.error(f"❌ 시트 데이터 로드 오류: {str(e)}")
+        return None
+
+def save_data_to_sheet(client, data, sheet_name="power_data", sheet_id=None, original_data=None):
+    """구글 시트에 데이터 저장 (변경된 부분만 업데이트)"""
+    try:
+        # 시트 열기 (ID가 제공된 경우 ID로, 아니면 이름으로)
+        if sheet_id and sheet_id.strip():
+            sheet = client.open_by_key(sheet_id).sheet1
+        else:
+            sheet = client.open(sheet_name).sheet1
+        
+        # 원본 데이터가 제공된 경우 변경된 부분만 감지
+        if original_data is not None:
+            # 변경된 행과 열 감지
+            changed_rows = []
+            changed_columns = []
+            
+            # 데이터 타입 통일을 위해 문자열로 변환하여 비교
+            data_str = data.astype(str)
+            original_str = original_data.astype(str)
+            
+            # 변경된 행 감지
+            for idx in range(len(data)):
+                if not data_str.iloc[idx].equals(original_str.iloc[idx]):
+                    changed_rows.append(idx + 2)  # +2는 헤더(1)와 0-based 인덱스(1) 때문
+            
+            # 변경된 열 감지
+            for col in data.columns:
+                if not data_str[col].equals(original_str[col]):
+                    changed_columns.append(col)
+            
+            # 변경된 부분만 업데이트
+            if changed_rows:
+                # 변경된 행들만 업데이트
+                for row_idx in changed_rows:
+                    # 해당 행의 데이터 준비
+                    row_data = data.iloc[row_idx - 2]  # -2는 위의 +2와 상쇄
+                    
+                    # 각 값을 문자열로 변환 (날짜는 년월일까지만)
+                    row_values = []
+                    for val in row_data:
+                        if pd.isna(val):
+                            row_values.append('')
+                        elif isinstance(val, pd.Timestamp):
+                            row_values.append(val.strftime('%Y-%m-%d'))
+                        elif isinstance(val, str) and 'T' in val:  # ISO 형식 날짜 문자열
+                            try:
+                                date_obj = pd.to_datetime(val)
+                                row_values.append(date_obj.strftime('%Y-%m-%d'))
+                            except:
+                                row_values.append(str(val))
+                        else:
+                            row_values.append(str(val))
+                    
+                    # 해당 행 업데이트 (A2부터 시작하므로 row_idx 사용)
+                    range_name = f'A{row_idx}:{chr(65 + len(row_values) - 1)}{row_idx}'
+                    sheet.update(range_name, [row_values])
+                
+                return True, f"✅ {len(changed_rows)}개 행이 업데이트되었습니다."
+        
+        # 원본 데이터가 없거나 전체 업데이트가 필요한 경우
+        data_to_save = data.copy()
+        
+        # 날짜 컬럼을 년월일까지만 표시하도록 변환
+        for col in data_to_save.columns:
+            if data_to_save[col].dtype == 'datetime64[ns]':
+                data_to_save[col] = data_to_save[col].dt.strftime('%Y-%m-%d')
+            elif data_to_save[col].dtype == 'object':
+                # 문자열 컬럼에서 날짜 형식인지 확인
+                try:
+                    # 첫 번째 유효한 값으로 날짜 형식 확인
+                    first_valid = data_to_save[col].dropna().iloc[0] if len(data_to_save[col].dropna()) > 0 else None
+                    if first_valid and isinstance(first_valid, str) and ('T' in first_valid or '-' in first_valid):
+                        # 날짜 형식으로 변환 시도
+                        data_to_save[col] = pd.to_datetime(data_to_save[col], errors='coerce').dt.strftime('%Y-%m-%d')
+                except:
+                    pass  # 변환 실패 시 원본 유지
+        
+        # 모든 데이터를 한 번에 업데이트 (API 호출 최소화)
+        all_values = [data_to_save.columns.tolist()]  # 헤더
+        for _, row in data_to_save.iterrows():
+            # 각 값을 문자열로 변환
+            row_values = [str(val) if val is not None else '' for val in row.tolist()]
+            all_values.append(row_values)
+        
+        # 시트를 한 번에 업데이트
+        sheet.clear()
+        sheet.update('A1', all_values)
+        
+        return True, "✅ 전체 데이터가 업데이트되었습니다."
+        
+    except Exception as e:
+        st.error(f"❌ 시트 데이터 저장 오류: {str(e)}")
+        return False, f"❌ 저장 실패: {str(e)}"
+
 # 사이드바 - 데이터 정보
 with st.sidebar:
     st.header("📊 데이터 정보")
@@ -46,20 +228,51 @@ with st.sidebar:
             st.error("❌ 모델 성능이 낮습니다. 특징 공학이나 모델 튜닝이 필요합니다.")
     else:
         st.info("모델 학습 후 성능 평가가 표시됩니다.")
-    
-
 
 # --- 0. 데이터 로딩 및 편집 ---
 st.header("📁 Step 0: 데이터 로딩 및 편집")
 
-# 데이터 로딩
-try:
-    file_path = 'power_data.xlsx' 
-    data = pd.read_excel(file_path)
-    st.success("✅ 기본 파일 로딩 성공!")
-except Exception as e:
-    st.error(f"❌ 기본 파일 로딩 오류: {str(e)}")
+# 구글 시트 설정
+st.subheader("🔐 구글 시트 연결 설정")
+
+# 구글 시트 클라이언트 설정
+client = setup_google_sheets()
+
+if client is None:
+    st.error("❌ 구글 시트 연결에 실패했습니다.")
+    st.info("""
+    **구글 시트 설정 확인:**
+    1. 구글 시트 ID: `1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4`에 접근 가능한지 확인
+    2. 서비스 계정 이메일: `firebase-adminsdk-fbsvc@test-92f50.iam.gserviceaccount.com`이 편집자 권한으로 공유되어 있는지 확인
+    """)
     st.stop()
+else:
+    st.success("✅ 구글 시트 연결 성공!")
+
+# 구글 시트 설정 정보
+sheet_name = "시트1"
+sheet_id = "1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4"
+
+# 데이터 로딩
+if st.button("📊 데이터 로드", type="primary"):
+    with st.spinner("구글 시트에서 데이터를 로딩 중..."):
+        data = load_data_from_sheet(client, sheet_name, sheet_id)
+        
+        if data is not None:
+            st.session_state.data = data
+            # 원본 데이터 저장 (변경 감지를 위해)
+            st.session_state.original_data = data.copy()
+            st.success("✅ 구글 시트에서 데이터 로딩 성공!")
+        else:
+            st.error("❌ 데이터 로딩에 실패했습니다.")
+            st.stop()
+
+# 데이터가 로드되었는지 확인
+if 'data' not in st.session_state:
+    st.info("👆 위의 '데이터 로드' 버튼을 클릭하여 구글 시트에서 데이터를 가져오세요.")
+    st.stop()
+
+data = st.session_state.data
 
 # 데이터 편집 기능
 st.subheader("📊 데이터 미리보기 및 편집")
@@ -71,12 +284,12 @@ with col1:
 with col2:
     st.metric("총 컬럼 수", f"{len(data.columns)}개")
 with col3:
-    # 날짜 컬럼이 있고 datetime 타입인 경우에만 strftime 사용
+    # 날짜 컬럼이 있으면 년월일까지만 표시
     if '날짜' in data.columns:
         try:
             # 날짜 컬럼을 datetime으로 변환
-            data['날짜'] = pd.to_datetime(data['날짜'])
-            start_date = data['날짜'].min().strftime('%Y-%m-%d')
+            date_data = pd.to_datetime(data['날짜'], errors='coerce')
+            start_date = date_data.min().strftime('%Y-%m-%d')
         except (ValueError, TypeError) as e:
             st.warning(f"날짜 변환 오류: {e}")
             start_date = "N/A"
@@ -86,7 +299,8 @@ with col3:
 with col4:
     if '날짜' in data.columns:
         try:
-            end_date = data['날짜'].max().strftime('%Y-%m-%d')
+            date_data = pd.to_datetime(data['날짜'], errors='coerce')
+            end_date = date_data.max().strftime('%Y-%m-%d')
         except (ValueError, TypeError) as e:
             st.warning(f"날짜 변환 오류: {e}")
             end_date = "N/A"
@@ -94,14 +308,29 @@ with col4:
         end_date = "N/A"
     st.metric("종료일", end_date)
 
-
-
 # 데이터 편집 탭
 tab1, tab2, tab3 = st.tabs(["📊 데이터 미리보기", "✏️ 데이터 편집", "📈 통계 정보"])
 
 with tab1:
     st.subheader("전체 데이터 미리보기")
-    st.dataframe(data, use_container_width=True)
+    
+    # 날짜 컬럼이 있으면 년월일까지만 표시하도록 변환
+    display_data = data.copy()
+    if '날짜' in display_data.columns:
+        try:
+            # 이미 문자열인 경우 그대로 사용, 아니면 변환
+            if display_data['날짜'].dtype == 'object':
+                # 이미 YYYY-MM-DD 형식인지 확인
+                sample_date = display_data['날짜'].iloc[0] if len(display_data) > 0 else ''
+                if isinstance(sample_date, str) and len(sample_date) == 10 and '-' in sample_date:
+                    pass  # 이미 올바른 형식
+                else:
+                    # datetime으로 변환 후 년월일까지만 표시
+                    display_data['날짜'] = pd.to_datetime(display_data['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
+        except Exception as e:
+            st.warning(f"날짜 표시 변환 중 오류: {e}")
+    
+    st.dataframe(display_data, use_container_width=True)
     
     # 데이터 다운로드
     csv = data.to_csv(index=False)
@@ -116,9 +345,25 @@ with tab2:
     st.subheader("데이터 편집")
     st.info("아래에서 데이터를 직접 편집할 수 있습니다. 편집 후 '변경사항 적용' 버튼을 클릭하세요.")
     
+    # 편집용 데이터 준비 (날짜는 년월일까지만 표시)
+    edit_data = data.copy()
+    if '날짜' in edit_data.columns:
+        try:
+            # 이미 문자열인 경우 그대로 사용, 아니면 변환
+            if edit_data['날짜'].dtype == 'object':
+                # 이미 YYYY-MM-DD 형식인지 확인
+                sample_date = edit_data['날짜'].iloc[0] if len(edit_data) > 0 else ''
+                if isinstance(sample_date, str) and len(sample_date) == 10 and '-' in sample_date:
+                    pass  # 이미 올바른 형식
+                else:
+                    # datetime으로 변환 후 년월일까지만 표시
+                    edit_data['날짜'] = pd.to_datetime(edit_data['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
+        except Exception as e:
+            st.warning(f"날짜 편집 변환 중 오류: {e}")
+    
     # 편집 가능한 데이터프레임
     edited_data = st.data_editor(
-        data,
+        edit_data,
         num_rows="dynamic",
         use_container_width=True,
         key="data_editor"
@@ -126,16 +371,37 @@ with tab2:
     
     # 변경사항 적용 버튼
     if st.button("✅ 변경사항 적용", type="primary"):
-        data = edited_data.copy()
-        st.success("✅ 데이터가 성공적으로 업데이트되었습니다!")
-        
-        # 원본 엑셀 파일 직접 수정
-        try:
-            data.to_excel('power_data.xlsx', index=False, engine='openpyxl')
-            st.success("💾 원본 엑셀 파일이 성공적으로 업데이트되었습니다!")
-        except Exception as e:
-            st.error(f"❌ 원본 파일 수정 오류: {str(e)}")
-            st.info("파일이 다른 프로그램에서 열려있거나 권한이 없을 수 있습니다.")
+        with st.spinner("구글 시트에 저장 중... (변경된 부분만 업데이트)"):
+            # 편집된 데이터를 전역 변수에 반영
+            data = edited_data.copy()
+            
+            # 날짜 컬럼을 datetime으로 변환 (편집 시 문자열로 표시되었으므로)
+            if '날짜' in data.columns:
+                try:
+                    data['날짜'] = pd.to_datetime(data['날짜'], errors='coerce')
+                except Exception as e:
+                    st.warning(f"날짜 변환 중 오류: {e}")
+            
+            st.session_state.data = data
+            
+            # 원본 데이터 가져오기 (세션에 저장된 원본 데이터)
+            original_data = st.session_state.get('original_data', None)
+            
+            # 구글 시트에 저장 (변경된 부분만 업데이트)
+            success, message = save_data_to_sheet(client, data, sheet_name, sheet_id, original_data)
+            
+            if success:
+                st.success(message)
+                
+                # 원본 데이터 업데이트 (다음 편집을 위해)
+                st.session_state.original_data = data.copy()
+                
+                # 페이지 새로고침을 위한 세션 상태 업데이트
+                st.session_state.data_updated = True
+                st.rerun()
+            else:
+                st.error("❌ 구글 시트 업데이트에 실패했습니다.")
+                st.info("💡 API 한도 초과로 인한 오류일 수 있습니다. 잠시 후 다시 시도해주세요.")
         
         # 업데이트된 데이터 다운로드
         csv_updated = data.to_csv(index=False)
@@ -170,7 +436,7 @@ with tab2:
                     st.error(f"❌ 엑셀 파일 생성 오류: {str(e)}")
         
         with col2:
-            st.success("✅ 원본 파일이 자동으로 업데이트됩니다!")
+            st.success("✅ 구글 시트가 자동으로 업데이트됩니다!")
 
 with tab3:
     st.subheader("데이터 통계 정보")
