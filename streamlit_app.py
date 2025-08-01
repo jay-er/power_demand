@@ -9,7 +9,12 @@ from typing import Optional, Dict, Any
 import io
 import gspread
 from google.oauth2.service_account import Credentials
+import os
 import json
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
 
 # 페이지 설정 (반드시 첫 번째 Streamlit 명령어여야 함)
 st.set_page_config(
@@ -32,101 +37,213 @@ if 'mae_min' not in st.session_state:
 if 'r2_min' not in st.session_state:
     st.session_state.r2_min = None
 
+# 구글 시트 설정
 def setup_google_sheets():
-    """구글 시트 연결 설정 (우선순위: 환경변수 > Streamlit Secrets > JSON 파일)"""
+    """구글 시트 연결 설정"""
     try:
-        # 1. 환경 변수에서 인증 정보 로드 (최고 우선순위)
-        import os
-        credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+        # 구글 시트 API 스코프 설정
+        scope = [
+            'https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive'
+        ]
         
-        if credentials_json:
+        # Streamlit secrets 디버깅
+        st.info("🔍 Streamlit secrets 상태 확인 중...")
+        if hasattr(st, 'secrets'):
+            st.info(f"✅ st.secrets 사용 가능")
+            if 'GOOGLE_CREDENTIALS_JSON' in st.secrets:
+                st.info("✅ GOOGLE_CREDENTIALS_JSON이 secrets에 존재합니다")
+            else:
+                st.warning("⚠️ GOOGLE_CREDENTIALS_JSON이 secrets에 없습니다")
+                st.info(f"사용 가능한 secrets 키: {list(st.secrets.keys())}")
+        else:
+            st.warning("⚠️ st.secrets를 사용할 수 없습니다")
+        
+        # 방법 1: Streamlit secrets에서 JSON 키 읽기 (우선순위)
+        if hasattr(st, 'secrets') and 'GOOGLE_CREDENTIALS_JSON' in st.secrets:
             try:
-                credentials_data = json.loads(credentials_json)
-                # 스코프 설정
-                scope = [
-                    'https://spreadsheets.google.com/feeds',
-                    'https://www.googleapis.com/auth/drive',
-                    'https://www.googleapis.com/auth/spreadsheets'
-                ]
+                st.info("🔍 Streamlit secrets에서 인증 정보를 읽는 중...")
+                google_credentials_json = st.secrets['GOOGLE_CREDENTIALS_JSON']
                 
-                # 인증 정보로 Credentials 생성
+                # JSON 문자열을 딕셔너리로 변환
+                credentials_data = json.loads(google_credentials_json)
+                
+                # private_key 형식 검증 및 수정
+                if 'private_key' in credentials_data:
+                    private_key = credentials_data['private_key']
+                    # 개행 문자 정규화
+                    if '\\n' in private_key:
+                        credentials_data['private_key'] = private_key.replace('\\n', '\n')
+                        st.info("✅ private_key 개행 문자 정규화 완료")
+                
+                # 필수 필드 확인
+                required_fields = ['type', 'project_id', 'private_key', 'client_email']
+                missing_fields = [field for field in required_fields if field not in credentials_data]
+                if missing_fields:
+                    st.error(f"❌ 필수 필드가 누락되었습니다: {missing_fields}")
+                    return None
+                
+                st.info("🔍 인증 정보 생성 중...")
+                
+                # 인증 정보 생성
                 creds = Credentials.from_service_account_info(
                     credentials_data, 
+                    scopes=scope
+                )
+                
+                st.info("🔍 gspread 클라이언트 생성 중...")
+                
+                # gspread 클라이언트 생성
+                client = gspread.authorize(creds)
+                
+                # 연결 테스트
+                st.info("🔍 구글 시트 연결 테스트 중...")
+                try:
+                    # 간단한 테스트로 연결 확인
+                    test_sheet = client.open_by_key("1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4")
+                    st.success("✅ 구글 시트 연결 성공!")
+                    return client
+                except Exception as test_error:
+                    st.error(f"❌ 구글 시트 접근 테스트 실패: {str(test_error)}")
+                    st.info("""
+                    **구글 시트 접근 권한 확인:**
+                    1. 서비스 계정 이메일: firebase-adminsdk-fbsvc@test-92f50.iam.gserviceaccount.com
+                    2. 구글 시트 ID: 1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4
+                    3. 서비스 계정이 구글 시트에 편집자 권한으로 공유되어 있는지 확인
+                    """)
+                    return None
+                    
+            except json.JSONDecodeError as e:
+                st.error(f"❌ JSON 파싱 오류: {str(e)}")
+                st.info("Streamlit secrets의 GOOGLE_CREDENTIALS_JSON 형식이 올바른지 확인해주세요.")
+                return None
+            except Exception as e:
+                st.error(f"❌ Streamlit secrets 인증 오류: {str(e)}")
+                return None
+        else:
+            st.warning("⚠️ Streamlit secrets에서 GOOGLE_CREDENTIALS_JSON을 찾을 수 없습니다.")
+        
+        # 방법 2: 환경변수에서 JSON 키 읽기
+        google_credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+        
+        if google_credentials_json:
+            try:
+                st.info("🔍 환경변수에서 인증 정보를 읽는 중...")
+                
+                # JSON 문자열을 딕셔너리로 변환
+                credentials_data = json.loads(google_credentials_json)
+                
+                # private_key 형식 검증 및 수정
+                if 'private_key' in credentials_data:
+                    private_key = credentials_data['private_key']
+                    # 개행 문자 정규화
+                    if '\\n' in private_key:
+                        credentials_data['private_key'] = private_key.replace('\\n', '\n')
+                        st.info("✅ private_key 개행 문자 정규화 완료")
+                
+                # 필수 필드 확인
+                required_fields = ['type', 'project_id', 'private_key', 'client_email']
+                missing_fields = [field for field in required_fields if field not in credentials_data]
+                if missing_fields:
+                    st.error(f"❌ 필수 필드가 누락되었습니다: {missing_fields}")
+                    return None
+                
+                st.info("🔍 인증 정보 생성 중...")
+                
+                # 인증 정보 생성
+                creds = Credentials.from_service_account_info(
+                    credentials_data, 
+                    scopes=scope
+                )
+                
+                st.info("🔍 gspread 클라이언트 생성 중...")
+                
+                # gspread 클라이언트 생성
+                client = gspread.authorize(creds)
+                
+                # 연결 테스트
+                st.info("🔍 구글 시트 연결 테스트 중...")
+                try:
+                    # 간단한 테스트로 연결 확인
+                    test_sheet = client.open_by_key("1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4")
+                    st.success("✅ 구글 시트 연결 성공!")
+                    return client
+                except Exception as test_error:
+                    st.error(f"❌ 구글 시트 접근 테스트 실패: {str(test_error)}")
+                    st.info("""
+                    **구글 시트 접근 권한 확인:**
+                    1. 서비스 계정 이메일: firebase-adminsdk-fbsvc@test-92f50.iam.gserviceaccount.com
+                    2. 구글 시트 ID: 1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4
+                    3. 서비스 계정이 구글 시트에 편집자 권한으로 공유되어 있는지 확인
+                    """)
+                    return None
+                    
+            except json.JSONDecodeError as e:
+                st.error(f"❌ JSON 파싱 오류: {str(e)}")
+                st.info("환경변수 GOOGLE_CREDENTIALS_JSON의 형식이 올바른지 확인해주세요.")
+                return None
+            except Exception as e:
+                st.error(f"❌ 인증 정보 생성 오류: {str(e)}")
+                st.info("""
+                **PEM 파일 오류 해결 방법:**
+                1. private_key의 개행 문자 확인
+                2. JSON 키 파일이 올바른 형식인지 확인
+                3. 서비스 계정 권한 확인
+                4. 네트워크 연결 상태 확인
+                """)
+                return None
+        
+        # 방법 3: JSON 파일에서 직접 읽기
+        json_file_path = "test-92f50-a704ebe1984f.json"
+        if os.path.exists(json_file_path):
+            try:
+                st.info(f"🔍 JSON 파일에서 인증 정보를 읽는 중: {json_file_path}")
+                
+                creds = Credentials.from_service_account_file(
+                    json_file_path,
                     scopes=scope
                 )
                 
                 # gspread 클라이언트 생성
                 client = gspread.authorize(creds)
                 return client
-                
             except Exception as e:
-                st.error(f"❌ 환경 변수에서 인증 정보 로드 실패: {str(e)}")
+                st.error(f"❌ JSON 파일 인증 오류: {str(e)}")
+                st.info(f"파일 경로: {json_file_path}")
+                return None
         
-        # 2. Streamlit Secrets에서 인증 정보 로드
-        try:
-            # 다양한 키 이름으로 시도
-            if 'GOOGLE_CREDENTIALS_JSON' in st.secrets:
-                credentials_data = json.loads(st.secrets['GOOGLE_CREDENTIALS_JSON'])
-            elif 'GOOGLE_SERVICE_ACCOUNT_INFO' in st.secrets:
-                credentials_data = st.secrets['GOOGLE_SERVICE_ACCOUNT_INFO']
-            else:
-                raise KeyError("Streamlit Secrets에 인증 정보가 없습니다")
-            
-            # 스코프 설정
-            scope = [
-                'https://spreadsheets.google.com/feeds',
-                'https://www.googleapis.com/auth/drive',
-                'https://www.googleapis.com/auth/spreadsheets'
-            ]
-            
-            # 인증 정보로 Credentials 생성
-            creds = Credentials.from_service_account_info(
-                credentials_data, 
-                scopes=scope
-            )
-            
-            # gspread 클라이언트 생성
-            client = gspread.authorize(creds)
-            return client
-            
-        except Exception as e:
-            st.error(f"❌ Streamlit Secrets에서 인증 정보 로드 실패: {str(e)}")
+        # 방법 4: 기본 인증 정보 사용 (개발용)
+        st.warning("⚠️ Streamlit secrets, 환경변수, JSON 파일을 찾을 수 없습니다.")
+        st.info("""
+        **구글 시트 연결 설정 방법:**
         
-        # 3. JSON 파일에서 인증 정보 로드 (개발 환경용)
-        json_file_path = "test-92f50-a704ebe1984f.json"
+        1. **Streamlit secrets 설정 (권장):**
+           - .streamlit/secrets.toml 파일에 GOOGLE_CREDENTIALS_JSON 설정
         
-        if not os.path.exists(json_file_path):
-            st.error(f"❌ JSON 파일을 찾을 수 없습니다: {json_file_path}")
-            return None
+        2. **환경변수 설정:**
+           - .env 파일에 GOOGLE_CREDENTIALS_JSON=파일내용 추가
         
-        # JSON 파일 읽기
-        with open(json_file_path, 'r', encoding='utf-8') as f:
-            credentials_data = json.load(f)
+        3. **JSON 파일 사용:**
+           - test-92f50-a704ebe1984f.json 파일이 프로젝트 루트에 있는지 확인
         
-        # 스코프 설정
-        scope = [
-            'https://spreadsheets.google.com/feeds',
-            'https://www.googleapis.com/auth/drive',
-            'https://www.googleapis.com/auth/spreadsheets'
-        ]
+        4. **서비스 계정 설정:**
+           - 구글 클라우드 콘솔에서 서비스 계정 키 생성
+           - 구글 시트에 서비스 계정 이메일 공유
+        """)
         
-        # 인증 정보로 Credentials 생성
-        creds = Credentials.from_service_account_info(
-            credentials_data, 
-            scopes=scope
-        )
-        
-        # gspread 클라이언트 생성
-        client = gspread.authorize(creds)
-        return client
-            
-    except json.JSONDecodeError as e:
-        st.error(f"❌ JSON 파싱 오류: {str(e)}")
+        # 개발용 더미 클라이언트 반환 (실제 연결은 안됨)
         return None
+            
     except Exception as e:
         st.error(f"❌ 구글 시트 연결 오류: {str(e)}")
+        st.info("""
+        **일반적인 해결 방법:**
+        1. JSON 키 파일이 올바른 형식인지 확인
+        2. 서비스 계정이 구글 시트에 접근 권한이 있는지 확인
+        3. 네트워크 연결 상태 확인
+        4. private_key의 개행 문자 형식 확인
+        """)
         return None
-
 
 def load_data_from_sheet(client, sheet_name="power_data", sheet_id=None):
     """구글 시트에서 데이터 로드"""
@@ -284,8 +401,8 @@ with st.sidebar:
 # --- 0. 데이터 로딩 및 편집 ---
 st.header("📁 Step 0: 데이터 로딩 및 편집")
 
-# 구글 시트 자동 연결
-st.subheader("🔐 구글 시트 자동 연결")
+# 구글 시트 설정
+st.subheader("🔐 구글 시트 연결 설정")
 
 # 구글 시트 클라이언트 설정
 client = setup_google_sheets()
@@ -293,51 +410,35 @@ client = setup_google_sheets()
 if client is None:
     st.error("❌ 구글 시트 연결에 실패했습니다.")
     st.info("""
-    🔧 **해결 방법:**
-    
-    1. **환경 변수 설정**: `GOOGLE_CREDENTIALS_JSON` 환경 변수에 JSON 문자열 설정
-    2. **Streamlit Secrets 설정**: `.streamlit/secrets.toml` 파일에 인증 정보 설정
-    3. **JSON 파일 확인**: `test-92f50-a704ebe1984f.json` 파일이 프로젝트 루트에 있는지 확인
-    4. **구글 시트 공유 설정**: 서비스 계정 이메일과 공유했는지 확인
+    **구글 시트 설정 확인:**
+    1. 구글 시트 ID: `1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4`에 접근 가능한지 확인
+    2. 서비스 계정 이메일: `firebase-adminsdk-fbsvc@test-92f50.iam.gserviceaccount.com`이 편집자 권한으로 공유되어 있는지 확인
     """)
     st.stop()
+else:
+    st.success("✅ 구글 시트 연결 성공!")
 
-st.session_state.google_client = client
-
-# 데이터 자동 로딩
-st.subheader("📊 데이터 자동 로딩")
-
-# 하드코딩된 시트 정보
+# 구글 시트 설정 정보
 sheet_name = "시트1"
 sheet_id = "1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4"
 
-# 자동으로 데이터 로드
-with st.spinner("구글 시트에서 데이터를 자동 로딩 중..."):
-    data = load_data_from_sheet(client, sheet_name, sheet_id)
-    
-    if data is not None:
-        st.session_state.data = data
-        # 원본 데이터 저장 (변경 감지를 위해)
-        st.session_state.original_data = data.copy()
+# 데이터 로딩
+if st.button("📊 데이터 로드", type="primary"):
+    with st.spinner("구글 시트에서 데이터를 로딩 중..."):
+        data = load_data_from_sheet(client, sheet_name, sheet_id)
         
-        # 데이터 미리보기
-        with st.expander("📋 로딩된 데이터 미리보기"):
-            st.dataframe(data.head(10), use_container_width=True)
-    else:
-        st.error("❌ 데이터 로딩에 실패했습니다.")
-        st.info("""
-        🔧 **문제 해결 방법:**
-        
-        1. **시트 이름/ID 확인**: 올바른 시트 이름이나 ID를 입력했는지 확인
-        2. **권한 확인**: 서비스 계정이 시트에 접근할 수 있는지 확인
-        3. **데이터 확인**: 시트에 헤더와 데이터가 있는지 확인
-        4. **인증 정보 확인**: 서비스 계정 키가 올바른지 확인
-        """)
-        st.stop()
+        if data is not None:
+            st.session_state.data = data
+            # 원본 데이터 저장 (변경 감지를 위해)
+            st.session_state.original_data = data.copy()
+            st.success("✅ 구글 시트에서 데이터 로딩 성공!")
+        else:
+            st.error("❌ 데이터 로딩에 실패했습니다.")
+            st.stop()
 
 # 데이터가 로드되었는지 확인
 if 'data' not in st.session_state:
-    st.error("❌ 데이터 로딩에 실패했습니다.")
+    st.info("👆 위의 '데이터 로드' 버튼을 클릭하여 구글 시트에서 데이터를 가져오세요.")
     st.stop()
 
 data = st.session_state.data
