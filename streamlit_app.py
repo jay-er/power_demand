@@ -796,6 +796,19 @@ with st.spinner("데이터를 전처리 중..."):
         st.info("필수 컬럼: 날짜, 최고기온, 평균기온, 최저기온, 최대수요, 최저수요, 요일, 평일")
         st.stop()
     
+    # 가스수요 데이터 확인
+    gas_columns = ['가스수요', '태양광최대']
+    available_gas_columns = [col for col in gas_columns if col in data.columns]
+    
+    if available_gas_columns:
+        st.success(f"✅ 가스수요 예측 가능: {', '.join(available_gas_columns)} 컬럼 발견")
+        if len(available_gas_columns) == 2:
+            st.info("🔥 가스수요 예측 모델 학습 가능")
+        else:
+            st.warning(f"⚠️ 가스수요 예측을 위해 추가 컬럼 필요: {[col for col in gas_columns if col not in available_gas_columns]}")
+    else:
+        st.info("ℹ️ 가스수요 예측을 위한 컬럼이 없습니다 (가스수요, 태양광최대)")
+    
     # 데이터 정보 표시
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -814,9 +827,27 @@ with st.spinner("특징 공학을 수행 중..."):
     data_processed = pd.get_dummies(data, columns=['요일', '평일'], drop_first=True)
     data_processed['어제의_최대수요'] = data_processed['최대수요'].shift(1)
     data_processed['어제의_최저수요'] = data_processed['최저수요'].shift(1)
-    data_processed.dropna(inplace=True)
     
-    st.success("✅ 데이터 정제 완료!")
+    # 가스수요 특징 공학
+    if '가스수요' in data_processed.columns and '태양광최대' in data_processed.columns:
+        # 가스수요 데이터를 숫자로 변환
+        data_processed['가스수요'] = pd.to_numeric(data_processed['가스수요'], errors='coerce')
+        data_processed['태양광최대'] = pd.to_numeric(data_processed['태양광최대'], errors='coerce')
+        
+        # 결측값 제거 후 특징 공학
+        gas_data_clean = data_processed[['가스수요', '태양광최대']].dropna()
+        if len(gas_data_clean) > 0:
+            data_processed['어제의_가스수요'] = data_processed['가스수요'].shift(1)
+            data_processed['가스수요_변화율'] = data_processed['가스수요'].pct_change()
+            data_processed['태양광_가스_비율'] = data_processed['태양광최대'] / data_processed['가스수요'].replace(0, 1)
+            st.success("✅ 전력수요 및 가스수요 데이터 정제 완료!")
+        else:
+            st.warning("⚠️ 가스수요 데이터가 숫자로 변환되지 않습니다.")
+            st.success("✅ 전력수요 데이터 정제 완료!")
+    else:
+        st.success("✅ 전력수요 데이터 정제 완료!")
+    
+    data_processed.dropna(inplace=True)
     
     # 처리된 데이터 정보
     col1, col2 = st.columns(2)
@@ -874,6 +905,36 @@ st.write(f"특징 변수: {len(features_min)}개")
 min_vars_df = pd.DataFrame([features_min], columns=[f'변수{i+1}' for i in range(len(features_min))])
 st.dataframe(min_vars_df, use_container_width=True)
 
+# 가스수요 모델 변수 (가능한 경우)
+if '가스수요' in data_processed.columns and '태양광최대' in data_processed.columns:
+    st.subheader("🔥 가스수요 모델 변수")
+    features_gas = ['최대수요', '태양광최대', '어제의_가스수요', '가스수요_변화율', '태양광_가스_비율']
+    available_gas_features = [col for col in features_gas if col in data_processed.columns]
+    
+    if len(available_gas_features) >= 2:  # 최소 2개 변수 필요
+        X_gas = data_processed[available_gas_features]
+        y_gas = data_processed['가스수요']
+        
+        # 가스수요 데이터 분할
+        X_gas_train, X_gas_test, y_gas_train, y_gas_test = train_test_split(
+            X_gas, y_gas, test_size=test_size, random_state=random_state
+        )
+        
+        st.write(f"특징 변수: {len(available_gas_features)}개")
+        gas_vars_df = pd.DataFrame([available_gas_features], columns=[f'변수{i+1}' for i in range(len(available_gas_features))])
+        st.dataframe(gas_vars_df, use_container_width=True)
+        
+        # 세션 상태에 저장
+        st.session_state.X_gas_train = X_gas_train
+        st.session_state.X_gas_test = X_gas_test
+        st.session_state.y_gas_train = y_gas_train
+        st.session_state.y_gas_test = y_gas_test
+        st.session_state.features_gas = available_gas_features
+    else:
+        st.warning("⚠️ 가스수요 예측을 위한 충분한 변수가 없습니다.")
+else:
+    st.info("ℹ️ 가스수요 예측을 위한 컬럼이 없습니다.")
+
 st.markdown("---")
 
 # --- 4. 모델 학습 ---
@@ -885,7 +946,14 @@ with st.spinner("모델을 학습 중..."):
     rf_min = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
     rf_min.fit(X_min_train, y_min_train)
     
-    st.success("✅ 모델 학습 완료!")
+    # 가스수요 모델 학습 (가능한 경우)
+    if hasattr(st.session_state, 'X_gas_train'):
+        rf_gas = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
+        rf_gas.fit(st.session_state.X_gas_train, st.session_state.y_gas_train)
+        st.session_state.rf_gas = rf_gas
+        st.success("✅ 전력수요 및 가스수요 모델 학습 완료!")
+    else:
+        st.success("✅ 전력수요 모델 학습 완료!")
 
 st.markdown("---")
 
@@ -900,19 +968,43 @@ with st.spinner("성능을 평가 중..."):
     st.session_state.r2_max = r2_score(y_max_test, y_max_pred)
     st.session_state.mae_min = mean_absolute_error(y_min_test, y_min_pred)
     st.session_state.r2_min = r2_score(y_min_test, y_min_pred)
+    
+    # 가스수요 모델 성능 평가 (가능한 경우)
+    if hasattr(st.session_state, 'rf_gas'):
+        y_gas_pred = st.session_state.rf_gas.predict(st.session_state.X_gas_test)
+        st.session_state.mae_gas = mean_absolute_error(st.session_state.y_gas_test, y_gas_pred)
+        st.session_state.r2_gas = r2_score(st.session_state.y_gas_test, y_gas_pred)
 
 # 성능 결과 표시
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("📈 최대수요 예측 모델 성능")
-    st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_max:,.0f} MW")
-    st.metric("결정 계수 (R²)", f"{st.session_state.r2_max:.4f}")
-
-with col2:
-    st.subheader("📉 최저수요 예측 모델 성능")
-    st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_min:,.0f} MW")
-    st.metric("결정 계수 (R²)", f"{st.session_state.r2_min:.4f}")
+if hasattr(st.session_state, 'rf_gas'):
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.subheader("📈 최대수요 예측 모델 성능")
+        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_max:,.0f} MW")
+        st.metric("결정 계수 (R²)", f"{st.session_state.r2_max:.4f}")
+    
+    with col2:
+        st.subheader("📉 최저수요 예측 모델 성능")
+        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_min:,.0f} MW")
+        st.metric("결정 계수 (R²)", f"{st.session_state.r2_min:.4f}")
+    
+    with col3:
+        st.subheader("🔥 가스수요 예측 모델 성능")
+        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_gas:,.0f} MW")
+        st.metric("결정 계수 (R²)", f"{st.session_state.r2_gas:.4f}")
+else:
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📈 최대수요 예측 모델 성능")
+        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_max:,.0f} MW")
+        st.metric("결정 계수 (R²)", f"{st.session_state.r2_max:.4f}")
+    
+    with col2:
+        st.subheader("📉 최저수요 예측 모델 성능")
+        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_min:,.0f} MW")
+        st.metric("결정 계수 (R²)", f"{st.session_state.r2_min:.4f}")
 
 st.markdown("---")
 
@@ -1189,19 +1281,130 @@ if predict_detailed_button:
             
             st.plotly_chart(fig_prediction_detailed, use_container_width=True)
             
-            # 두 예측 방식 비교
-            st.subheader("📊 예측 방식 비교")
-            comparison_data = pd.DataFrame({
-                '예측 방식': ['평균기온 기반', '상세 기온 기반'],
-                '최대수요 예측': [f"{predicted_max:,.0f} MW", f"{predicted_max_detailed:,.0f} MW"],
-                '최저수요 예측': [f"{predicted_min:,.0f} MW", f"{predicted_min_detailed:,.0f} MW"],
-                '수요 차이': [f"{predicted_max - predicted_min:,.0f} MW", f"{predicted_max_detailed - predicted_min_detailed:,.0f} MW"]
-            })
-            st.dataframe(comparison_data, use_container_width=True)
+
             
     except Exception as e:
         st.error(f"❌ 상세 예측 중 오류가 발생했습니다: {str(e)}")
         st.info("모델 학습이 완료되지 않았거나 입력 데이터에 문제가 있을 수 있습니다.")
+
+# --- 가스수요 예측 섹션 ---
+st.markdown("---")
+st.subheader("🔥 가스수요 예측")
+st.info("최대수요와 태양광최대를 기반으로 가스수요를 예측합니다.")
+
+# 가스수요 예측 (가능한 경우)
+if hasattr(st.session_state, 'rf_gas'):
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📝 가스수요 예측 조건 입력")
+        
+        # 최대수요 입력
+        max_demand_input = st.number_input(
+            "최대수요 (MW)",
+            min_value=0.0,
+            max_value=100000.0,
+            value=50000.0,
+            step=1000.0
+        )
+        
+        # 태양광최대 입력
+        solar_max_input = st.number_input(
+            "태양광최대 (MW)",
+            min_value=0.0,
+            max_value=10000.0,
+            value=5000.0,
+            step=100.0
+        )
+        
+        # 가스수요 예측 버튼
+        predict_gas_button = st.button("🔥 가스수요 예측", type="primary")
+    
+    with col2:
+        st.subheader("📊 가스수요 입력 정보")
+        st.write(f"**최대수요:** {max_demand_input:,.0f} MW")
+        st.write(f"**태양광최대:** {solar_max_input:,.0f} MW")
+    
+    # 가스수요 예측 실행
+    if predict_gas_button:
+        try:
+            with st.spinner("가스수요 예측을 수행 중..."):
+                # 예측 입력 데이터 준비 (Step 5의 특징 공학과 동일하게)
+                prediction_input_gas = pd.DataFrame({
+                    '최대수요': [max_demand_input],
+                    '태양광최대': [solar_max_input],
+                    '어제의_가스수요': [max_demand_input * 0.8],  # 추정값
+                    '가스수요_변화율': [0.05],  # 추정값
+                    '태양광_가스_비율': [solar_max_input / (max_demand_input * 0.8)]  # 추정값
+                })
+                
+                # Step 5에서 학습된 모델의 특징 변수와 동일하게 맞춤
+                if hasattr(st.session_state, 'features_gas'):
+                    prediction_input_gas = prediction_input_gas[st.session_state.features_gas]
+                    
+                    # 가스수요 예측
+                    predicted_gas_demand = st.session_state.rf_gas.predict(prediction_input_gas)[0]
+                    
+                    st.success("✅ 가스수요 예측 완료!")
+                    
+                    # 예측 결과 표시
+                    st.subheader("📊 가스수요 예측 결과")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("입력 최대수요", f"{max_demand_input:,.0f} MW")
+                    with col2:
+                        st.metric("입력 태양광최대", f"{solar_max_input:,.0f} MW")
+                    with col3:
+                        st.metric("예측 가스수요", f"{predicted_gas_demand:,.0f} MW")
+                    
+                    # 예측 신뢰도
+                    confidence_gas = min(95, max(60, st.session_state.r2_gas * 100))
+                    st.metric("예측 신뢰도", f"{confidence_gas:.1f}%")
+                    
+                    # 예측 결과 시각화
+                    st.subheader("📈 가스수요 예측 시각화")
+                    
+                    fig_prediction_gas = go.Figure()
+                    
+                    fig_prediction_gas.add_trace(go.Bar(
+                        x=['최대수요', '태양광최대', '예측 가스수요'],
+                        y=[max_demand_input, solar_max_input, predicted_gas_demand],
+                        name='입력값 및 예측값',
+                        marker_color=['red', 'orange', 'green']
+                    ))
+                    
+                    fig_prediction_gas.update_layout(
+                        title="가스수요 예측 결과",
+                        yaxis_title="값 (MW)",
+                        showlegend=True
+                    )
+                    
+                    st.plotly_chart(fig_prediction_gas, use_container_width=True)
+                    
+                    # 예측 근거 설명
+                    st.subheader("📋 예측 근거")
+                    feature_importance = st.session_state.rf_gas.feature_importances_
+                    
+                    # Step 5에서 학습된 모델의 실제 특징 변수 사용
+                    if hasattr(st.session_state, 'features_gas'):
+                        importance_df = pd.DataFrame({
+                            '특성': st.session_state.features_gas,
+                            '중요도': feature_importance
+                        }).sort_values('중요도', ascending=False)
+                        
+                        st.info(f"💡 주요 영향 요인: {importance_df.iloc[0]['특성']} ({importance_df.iloc[0]['중요도']:.1%})")
+                        if len(importance_df) > 1:
+                            st.info(f"💡 보조 영향 요인: {importance_df.iloc[1]['특성']} ({importance_df.iloc[1]['중요도']:.1%})")
+                    else:
+                        st.info("💡 모델의 특징 중요도 정보를 확인할 수 없습니다.")
+                    
+                else:
+                    st.error("❌ 가스수요 예측을 위한 충분한 특성이 없습니다.")
+                    
+        except Exception as e:
+            st.error(f"❌ 가스수요 예측 중 오류가 발생했습니다: {str(e)}")
+            st.info("가스수요 모델 학습이 완료되지 않았거나 입력 데이터에 문제가 있을 수 있습니다.")
 
 st.markdown("---")
 
