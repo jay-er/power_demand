@@ -371,58 +371,112 @@ def save_data_to_sheet(client, data, sheet_name="power_data", sheet_id=None, ori
         else:
             sheet = client.open(sheet_name).sheet1
         
-        # 원본 데이터가 제공된 경우 변경된 부분만 감지
+        # 월 컬럼 제거 (내부 계산용이므로 구글 시트에 저장하지 않음)
+        data_to_save = data.copy()
+        if '월' in data_to_save.columns:
+            data_to_save = data_to_save.drop(columns=['월'])
+        
+        # 원본 데이터도 월 컬럼 제거하여 비교
+        original_data_to_compare = None
         if original_data is not None:
+            original_data_to_compare = original_data.copy()
+            if '월' in original_data_to_compare.columns:
+                original_data_to_compare = original_data_to_compare.drop(columns=['월'])
+        
+        # 원본 데이터가 제공된 경우 변경된 부분만 감지
+        if original_data_to_compare is not None:
             # 변경된 행과 열 감지
             changed_rows = []
             changed_columns = []
             
             # 데이터 타입 통일을 위해 문자열로 변환하여 비교
-            data_str = data.astype(str)
-            original_str = original_data.astype(str)
+            data_str = data_to_save.astype(str)
+            original_str = original_data_to_compare.astype(str)
             
             # 변경된 행 감지
-            for idx in range(len(data)):
-                if not data_str.iloc[idx].equals(original_str.iloc[idx]):
+            for idx in range(len(data_to_save)):
+                if idx < len(original_str) and not data_str.iloc[idx].equals(original_str.iloc[idx]):
                     changed_rows.append(idx + 2)  # +2는 헤더(1)와 0-based 인덱스(1) 때문
             
             # 변경된 열 감지
-            for col in data.columns:
-                if not data_str[col].equals(original_str[col]):
+            for col in data_to_save.columns:
+                if col in original_str.columns and not data_str[col].equals(original_str[col]):
                     changed_columns.append(col)
             
-            # 변경된 부분만 업데이트
+            # 변경된 부분만 업데이트 (최적화된 배치 방식)
             if changed_rows:
-                # 변경된 행들만 업데이트
-                for row_idx in changed_rows:
-                    # 해당 행의 데이터 준비
-                    row_data = data.iloc[row_idx - 2]  # -2는 위의 +2와 상쇄
-                    
-                    # 각 값을 문자열로 변환 (날짜는 년월일까지만)
-                    row_values = []
-                    for val in row_data:
-                        if pd.isna(val):
-                            row_values.append('')
-                        elif isinstance(val, pd.Timestamp):
-                            row_values.append(val.strftime('%Y-%m-%d'))
-                        elif isinstance(val, str) and 'T' in val:  # ISO 형식 날짜 문자열
-                            try:
-                                date_obj = pd.to_datetime(val)
-                                row_values.append(date_obj.strftime('%Y-%m-%d'))
-                            except:
-                                row_values.append(str(val))
-                        else:
-                            row_values.append(str(val))
-                    
-                    # 해당 행 업데이트 (A2부터 시작하므로 row_idx 사용)
-                    range_name = f'A{row_idx}:{chr(65 + len(row_values) - 1)}{row_idx}'
-                    sheet.update(range_name, [row_values])
+                # 변경된 행들을 하나의 연속된 범위로 그룹화
+                changed_rows.sort()  # 행 번호 정렬
                 
-                return True, f"✅ {len(changed_rows)}개 행이 업데이트되었습니다."
+                # 연속된 행들을 그룹으로 나누기
+                row_groups = []
+                current_group = [changed_rows[0]]
+                
+                for i in range(1, len(changed_rows)):
+                    if changed_rows[i] == changed_rows[i-1] + 1:
+                        # 연속된 행
+                        current_group.append(changed_rows[i])
+                    else:
+                        # 불연속된 행 - 새 그룹 시작
+                        row_groups.append(current_group)
+                        current_group = [changed_rows[i]]
+                
+                row_groups.append(current_group)  # 마지막 그룹 추가
+                
+                # 각 그룹을 하나의 범위로 업데이트
+                for group in row_groups:
+                    start_row = group[0]
+                    end_row = group[-1]
+                    
+                    # 해당 범위의 데이터 추출
+                    group_data = data_to_save.iloc[start_row-2:end_row-1]  # -2는 인덱스 조정
+                    
+                    # 각 행을 문자열로 변환
+                    group_values = []
+                    for _, row in group_data.iterrows():
+                        row_values = []
+                        for val in row:
+                            if pd.isna(val):
+                                row_values.append('')
+                            elif isinstance(val, pd.Timestamp):
+                                row_values.append(val.strftime('%Y-%m-%d'))
+                            elif isinstance(val, str) and 'T' in val:
+                                try:
+                                    date_obj = pd.to_datetime(val)
+                                    row_values.append(date_obj.strftime('%Y-%m-%d'))
+                                except:
+                                    row_values.append(str(val))
+                            else:
+                                row_values.append(str(val))
+                        group_values.append(row_values)
+                    
+                    # 범위 업데이트 (연속된 행들을 한 번에)
+                    range_name = f'A{start_row}:{chr(65 + len(group_values[0]) - 1)}{end_row}'
+                    
+                    # 서식 복사: 바로 위 행의 서식을 따라가도록 설정
+                    try:
+                        # 위 행의 서식 정보 가져오기
+                        if start_row > 2:  # 첫 번째 행이 아닌 경우
+                            # 기본 서식 설정 (위 행과 동일한 스타일)
+                            format_range = f'A{start_row}:{chr(65 + len(group_values[0]) - 1)}{end_row}'
+                            
+                            # 기본 서식 적용 (11pt Arial 폰트만)
+                            sheet.format(format_range, {
+                                "textFormat": {
+                                    "fontSize": 11,
+                                    "fontFamily": "Arial"
+                                }
+                            })
+                            st.info(f"✅ 서식 적용 완료: {format_range}")
+                    except Exception as e:
+                        st.warning(f"⚠️ 서식 적용 실패: {str(e)}")
+                    
+                    # 데이터 업데이트
+                    sheet.update(range_name, group_values)
+                
+                return True, f"✅ {len(changed_rows)}개 행이 {len(row_groups)}개 그룹으로 업데이트되었습니다."
         
         # 원본 데이터가 없거나 전체 업데이트가 필요한 경우
-        data_to_save = data.copy()
-        
         # 날짜 컬럼을 년월일까지만 표시하도록 변환
         for col in data_to_save.columns:
             if data_to_save[col].dtype == 'datetime64[ns]':
@@ -580,14 +634,27 @@ with tab1:
 with tab2:
     st.subheader("데이터 편집")
     st.info("아래에서 데이터를 직접 편집하거나 구글시트에서 편집할 수 있습니다. 편집 후 '변경사항 적용' 버튼을 클릭하세요.")
-    # 편집용 데이터 준비 (날짜는 년월일까지만 표시)
-    edit_data = data.copy()
-    if '날짜' in edit_data.columns:
-        try:
-            # datetime으로 변환 후 년월일까지만 표시
-            edit_data['날짜'] = pd.to_datetime(edit_data['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
-        except Exception as e:
-            st.warning(f"날짜 편집 변환 중 오류: {e}")
+    # 편집용 데이터 준비 (세션 상태 사용하여 안정성 확보)
+    if 'edit_data' not in st.session_state:
+        # 처음 로드할 때만 편집용 데이터 준비
+        edit_data = data.copy()
+        
+        # 월 컬럼이 있으면 제거 (내부 계산용이므로 편집 불가)
+        if '월' in edit_data.columns:
+            edit_data = edit_data.drop(columns=['월'])
+        
+        if '날짜' in edit_data.columns:
+            try:
+                # datetime으로 변환 후 년월일까지만 표시
+                edit_data['날짜'] = pd.to_datetime(edit_data['날짜'], errors='coerce').dt.strftime('%Y-%m-%d')
+            except Exception as e:
+                st.warning(f"날짜 편집 변환 중 오류: {e}")
+        
+        # 세션 상태에 저장
+        st.session_state.edit_data = edit_data
+    else:
+        # 세션 상태에서 편집용 데이터 가져오기
+        edit_data = st.session_state.edit_data
     
     # 편집 가능한 데이터프레임
     edited_data = st.data_editor(
@@ -610,7 +677,19 @@ with tab2:
                 except Exception as e:
                     st.warning(f"날짜 변환 중 오류: {e}")
             
+            # 월 컬럼 다시 추가 (내부 계산용)
+            if '날짜' in data.columns:
+                try:
+                    # 날짜에서 월 추출하여 월 컬럼 추가
+                    data['월'] = pd.to_datetime(data['날짜']).dt.month
+                except Exception as e:
+                    st.warning(f"월 컬럼 계산 중 오류: {e}")
+            
             st.session_state.data = data
+            
+            # 편집용 데이터 세션 상태 초기화 (다음 편집을 위해)
+            if 'edit_data' in st.session_state:
+                del st.session_state.edit_data
             
             # 원본 데이터 가져오기 (세션에 저장된 원본 데이터)
             original_data = st.session_state.get('original_data', None)
