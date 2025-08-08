@@ -3,6 +3,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
+from lightgbm import LGBMRegressor
 import plotly.express as px
 import plotly.graph_objects as go
 from typing import Optional, Dict, Any
@@ -833,6 +834,12 @@ with st.spinner("특징 공학을 수행 중..."):
         # 가스수요 데이터를 숫자로 변환
         data_processed['가스수요'] = pd.to_numeric(data_processed['가스수요'], errors='coerce')
         data_processed['태양광최대'] = pd.to_numeric(data_processed['태양광최대'], errors='coerce')
+        # 잔여부하(최대수요 - 태양광최대)
+        if '최대수요' in data_processed.columns:
+            try:
+                data_processed['잔여부하'] = pd.to_numeric(data_processed['최대수요'], errors='coerce') - data_processed['태양광최대']
+            except Exception:
+                pass
         
         # 결측값 제거 후 특징 공학
         gas_data_clean = data_processed[['가스수요', '태양광최대']].dropna()
@@ -840,6 +847,15 @@ with st.spinner("특징 공학을 수행 중..."):
             data_processed['어제의_가스수요'] = data_processed['가스수요'].shift(1)
             data_processed['가스수요_변화율'] = data_processed['가스수요'].pct_change()
             data_processed['태양광_가스_비율'] = data_processed['태양광최대'] / data_processed['가스수요'].replace(0, 1)
+            # 예측 시 사용하기 위한 최신 관측 래그 보관
+            try:
+                last_two_gas = pd.to_numeric(gas_data_clean['가스수요'], errors='coerce').dropna().tail(2).values
+                if len(last_two_gas) >= 1:
+                    st.session_state.last_gas = float(last_two_gas[-1])
+                if len(last_two_gas) == 2:
+                    st.session_state.prev_gas = float(last_two_gas[0])
+            except Exception:
+                pass
             st.success("✅ 전력수요 및 가스수요 데이터 정제 완료!")
         else:
             st.warning("⚠️ 가스수요 데이터가 숫자로 변환되지 않습니다.")
@@ -884,7 +900,7 @@ test_size = 0.2
 n_estimators = 100
 random_state = 42
 
-# train_test_split을 사용한 랜덤 분할
+# 랜덤 분할로 복구
 X_max_train, X_max_test, y_max_train, y_max_test = train_test_split(
     X_max, y_max, test_size=test_size, random_state=random_state
 )
@@ -908,14 +924,14 @@ st.dataframe(min_vars_df, use_container_width=True)
 # 가스수요 모델 변수 (가능한 경우)
 if '가스수요' in data_processed.columns and '태양광최대' in data_processed.columns:
     st.subheader("🔥 가스수요 모델 변수")
-    features_gas = ['최대수요', '태양광최대', '어제의_가스수요', '가스수요_변화율', '태양광_가스_비율']
+    features_gas = ['최대수요', '태양광최대', '잔여부하', '어제의_가스수요', '가스수요_변화율', '태양광_가스_비율']
     available_gas_features = [col for col in features_gas if col in data_processed.columns]
     
     if len(available_gas_features) >= 2:  # 최소 2개 변수 필요
         X_gas = data_processed[available_gas_features]
         y_gas = data_processed['가스수요']
         
-        # 가스수요 데이터 분할
+        # 가스수요 데이터 분할 (랜덤)
         X_gas_train, X_gas_test, y_gas_train, y_gas_test = train_test_split(
             X_gas, y_gas, test_size=test_size, random_state=random_state
         )
@@ -946,12 +962,33 @@ with st.spinner("모델을 학습 중..."):
     rf_min = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
     rf_min.fit(X_min_train, y_min_train)
     
-    # 가스수요 모델 학습 (가능한 경우)
+    # 가스수요 모델 학습 (가능한 경우) - LightGBM + 단조 제약
     if hasattr(st.session_state, 'X_gas_train'):
-        rf_gas = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
-        rf_gas.fit(st.session_state.X_gas_train, st.session_state.y_gas_train)
-        st.session_state.rf_gas = rf_gas
-        st.success("✅ 전력수요 및 가스수요 모델 학습 완료!")
+        # 단조 제약 설정: 최대수요(+1), 태양광최대(-1), 어제의_가스수요(+1), 그 외(0)
+        features_for_constraints = st.session_state.features_gas
+        # 핵심 변수만 단조 제약 적용(과제약 방지)
+        constraint_map = {
+            '최대수요': 1,
+            '태양광최대': -1,
+            '잔여부하': 1,
+            '어제의_가스수요': 0,
+            '가스수요_변화율': 0,
+            '태양광_가스_비율': 0,
+        }
+        monotone_constraints = [constraint_map.get(f, 0) for f in features_for_constraints]
+
+        lgb_gas = LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            num_leaves=63,
+            min_child_samples=10,
+            random_state=random_state,
+            n_jobs=-1,
+            monotone_constraints=monotone_constraints
+        )
+        lgb_gas.fit(st.session_state.X_gas_train, st.session_state.y_gas_train)
+        st.session_state.gas_model = lgb_gas
+        st.success("✅ 전력수요 및 가스수요 모델 학습 완료! (LightGBM + 단조 제약)")
     else:
         st.success("✅ 전력수요 모델 학습 완료!")
 
@@ -970,13 +1007,13 @@ with st.spinner("성능을 평가 중..."):
     st.session_state.r2_min = r2_score(y_min_test, y_min_pred)
     
     # 가스수요 모델 성능 평가 (가능한 경우)
-    if hasattr(st.session_state, 'rf_gas'):
-        y_gas_pred = st.session_state.rf_gas.predict(st.session_state.X_gas_test)
+    if hasattr(st.session_state, 'gas_model'):
+        y_gas_pred = st.session_state.gas_model.predict(st.session_state.X_gas_test)
         st.session_state.mae_gas = mean_absolute_error(st.session_state.y_gas_test, y_gas_pred)
         st.session_state.r2_gas = r2_score(st.session_state.y_gas_test, y_gas_pred)
 
 # 성능 결과 표시
-if hasattr(st.session_state, 'rf_gas'):
+if hasattr(st.session_state, 'gas_model'):
     col1, col2, col3 = st.columns(3)
     
     with col1:
@@ -1293,7 +1330,7 @@ st.subheader("🔥 가스수요 예측")
 st.info("최대수요와 태양광최대를 기반으로 가스수요를 예측합니다.")
 
 # 가스수요 예측 (가능한 경우)
-if hasattr(st.session_state, 'rf_gas'):
+if hasattr(st.session_state, 'gas_model'):
     col1, col2 = st.columns(2)
     
     with col1:
@@ -1329,13 +1366,26 @@ if hasattr(st.session_state, 'rf_gas'):
     if predict_gas_button:
         try:
             with st.spinner("가스수요 예측을 수행 중..."):
-                # 예측 입력 데이터 준비 (Step 5의 특징 공학과 동일하게)
+                # 예측 입력 데이터 준비 (학습 시 사용한 특징과 정합)
+                last_gas = st.session_state.get('last_gas', None)
+                prev_gas = st.session_state.get('prev_gas', None)
+
+                # 변화율 계산 (가능하면), 불가 시 0.0
+                if last_gas is not None and prev_gas is not None and prev_gas != 0:
+                    gas_rate = (last_gas - prev_gas) / prev_gas
+                else:
+                    gas_rate = 0.0
+
+                # 태양광/가스 비율 (0 나눗셈 방지)
+                denom = last_gas if (last_gas is not None and last_gas != 0) else 1.0
+
                 prediction_input_gas = pd.DataFrame({
                     '최대수요': [max_demand_input],
                     '태양광최대': [solar_max_input],
-                    '어제의_가스수요': [max_demand_input * 0.8],  # 추정값
-                    '가스수요_변화율': [0.05],  # 추정값
-                    '태양광_가스_비율': [solar_max_input / (max_demand_input * 0.8)]  # 추정값
+                    '잔여부하': [max_demand_input - solar_max_input],
+                    '어제의_가스수요': [last_gas if last_gas is not None else 0.0],
+                    '가스수요_변화율': [gas_rate],
+                    '태양광_가스_비율': [solar_max_input / denom]
                 })
                 
                 # Step 5에서 학습된 모델의 특징 변수와 동일하게 맞춤
@@ -1343,7 +1393,9 @@ if hasattr(st.session_state, 'rf_gas'):
                     prediction_input_gas = prediction_input_gas[st.session_state.features_gas]
                     
                     # 가스수요 예측
-                    predicted_gas_demand = st.session_state.rf_gas.predict(prediction_input_gas)[0]
+                    predicted_gas_demand = st.session_state.gas_model.predict(prediction_input_gas)[0]
+                    # 물리적 클리핑: 0 ≤ 가스 ≤ 최대수요
+                    predicted_gas_demand = max(0.0, min(predicted_gas_demand, max_demand_input))
                     
                     st.success("✅ 가스수요 예측 완료!")
                     
@@ -1384,7 +1436,7 @@ if hasattr(st.session_state, 'rf_gas'):
                     
                     # 예측 근거 설명
                     st.subheader("📋 예측 근거")
-                    feature_importance = st.session_state.rf_gas.feature_importances_
+                    feature_importance = st.session_state.gas_model.feature_importances_
                     
                     # Step 5에서 학습된 모델의 실제 특징 변수 사용
                     if hasattr(st.session_state, 'features_gas'):
