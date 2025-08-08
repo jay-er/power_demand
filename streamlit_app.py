@@ -1312,9 +1312,9 @@ if hasattr(st.session_state, 'rf_gas'):
         solar_max_input = st.number_input(
             "태양광최대 (MW)",
             min_value=0.0,
-            max_value=10000.0,
-            value=5000.0,
-            step=100.0
+            max_value=100000.0,
+            value=50000.0,
+            step=1000.0
         )
         
         # 가스수요 예측 버튼
