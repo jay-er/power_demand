@@ -7,3 +7,4 @@ gspread
 google-auth
 python-dotenv 
 lightgbm>=4.0.0
+holidays>=0.56

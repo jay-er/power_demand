@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, TimeSeriesSplit, RandomizedSearchCV
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 from lightgbm import LGBMRegressor
@@ -14,6 +14,7 @@ from google.oauth2.service_account import Credentials
 import os
 import json
 from functools import partial
+import holidays
 
 # 성능 관련 상수
 APPLY_SHEET_FORMATTING = False  # 구글시트 업데이트 시 서식 적용 여부 (속도 개선을 위해 기본 비활성화)
@@ -25,6 +26,80 @@ def train_rf_model(X: pd.DataFrame, y: pd.Series, *, n_estimators: int, random_s
     model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
     model.fit(X, y)
     return model
+
+def tune_rf_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    random_state: int,
+):
+    """간단한 시계열 CV 기반 RandomForest 튜닝."""
+    # 시계열 분할 (인덱스 순서를 시간 순서로 가정)
+    tscv = TimeSeriesSplit(n_splits=3)
+    param_distributions = {
+        'n_estimators': [100, 200, 300],
+        'max_depth': [None, 8, 12, 16],
+        'min_samples_leaf': [1, 2, 4],
+    }
+    base = RandomForestRegressor(random_state=random_state, n_jobs=-1)
+    search = RandomizedSearchCV(
+        estimator=base,
+        param_distributions=param_distributions,
+        n_iter=6,
+        scoring='neg_mean_absolute_error',
+        cv=tscv,
+        random_state=random_state,
+        n_jobs=-1,
+        verbose=0,
+    )
+    search.fit(X, y)
+    return search.best_estimator_
+
+def chronological_split(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.Series,
+    *,
+    test_size: float,
+):
+    """시간 순서(오름차순)로 학습/평가 세트를 분할합니다.
+
+    마지막 test_size 비율 구간을 테스트로 사용합니다.
+    """
+    try:
+        # 정렬용 인덱스
+        sort_idx = dates.sort_values().index
+        X_sorted = X.loc[sort_idx]
+        y_sorted = y.loc[sort_idx]
+        split_idx = int(len(X_sorted) * (1 - test_size))
+        split_idx = max(1, min(split_idx, len(X_sorted) - 1))
+        return (
+            X_sorted.iloc[:split_idx],
+            X_sorted.iloc[split_idx:],
+            y_sorted.iloc[:split_idx],
+            y_sorted.iloc[split_idx:],
+        )
+    except Exception:
+        # 실패 시 안전하게 전체를 학습으로 반환
+        return X, X.iloc[0:0], y, y.iloc[0:0]
+
+def align_features_for_model(model, df: pd.DataFrame) -> pd.DataFrame:
+    """모델 학습 시 사용한 컬럼 집합(feature_names_in_)에 입력을 정렬.
+    - 학습 시 있었던 컬럼이 예측 시 없으면 0으로 생성
+    - 학습 시 없던 컬럼은 드롭
+    - 컬럼 순서 일치
+    """
+    try:
+        feature_names = list(getattr(model, 'feature_names_in_', []))
+        if feature_names:
+            for col in feature_names:
+                if col not in df.columns:
+                    df[col] = 0.0
+            # 여분 컬럼 제거 및 순서 정렬
+            df = df[feature_names]
+    except Exception:
+        pass
+    return df
 
 @st.cache_resource(show_spinner=False)
 def train_lgbm_gas_model(
@@ -67,10 +142,6 @@ if 'mae_max' not in st.session_state:
     st.session_state.mae_max = None
 if 'r2_max' not in st.session_state:
     st.session_state.r2_max = None
-if 'mae_min' not in st.session_state:
-    st.session_state.mae_min = None
-if 'r2_min' not in st.session_state:
-    st.session_state.r2_min = None
 
 # 구글 시트 설정
 @st.cache_resource(show_spinner=False)
@@ -385,7 +456,7 @@ def load_data_from_sheet(client, sheet_name="power_data", sheet_id=None):
         df = pd.DataFrame(data_rows, columns=headers)
         
         # 수치형 컬럼 변환
-        numeric_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '최저수요', '체감온도']
+        numeric_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '체감온도']
         for col in numeric_columns:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -554,23 +625,7 @@ def save_data_to_sheet(client, data, sheet_name="power_data", sheet_id=None, ori
         st.error(f"❌ 시트 데이터 저장 오류: {str(e)}")
         return False, f"❌ 저장 실패: {str(e)}"
 
-# 사이드바 - 데이터 정보
-with st.sidebar:
-    st.header("📊 데이터 정보")
-    
-    # 성능 평가 메시지 추가
-    st.markdown("---")
-    st.header("📊 모델 성능 평가")
-    
-    if st.session_state.r2_max is not None and st.session_state.r2_min is not None:
-        if st.session_state.r2_max > 0.8 and st.session_state.r2_min > 0.8:
-            st.success("🎉 두 모델 모두 우수한 성능을 보입니다!")
-        elif st.session_state.r2_max > 0.6 and st.session_state.r2_min > 0.6:
-            st.warning("⚠️ 모델 성능이 보통 수준입니다. 개선이 필요할 수 있습니다.")
-        else:
-            st.error("❌ 모델 성능이 낮습니다. 특징 공학이나 모델 튜닝이 필요합니다.")
-    else:
-        st.info("모델 학습 후 성능 평가가 표시됩니다.")
+# 사이드바 제거됨 (요청에 따라 비표시)
 
 # --- 0. 데이터 로딩 및 편집 ---
 st.header("📁 Step 0: 데이터 로딩 및 편집")
@@ -822,21 +877,31 @@ with st.spinner("데이터를 전처리 중..."):
         st.error("❌ '날짜' 컬럼이 없습니다. 데이터를 확인해주세요.")
         st.stop()
     
+    # 요일/평일 파생 (없으면 생성)
+    try:
+        weekday_map = {0: '월요일', 1: '화요일', 2: '수요일', 3: '목요일', 4: '금요일', 5: '토요일', 6: '일요일'}
+        if '요일' not in data.columns:
+            data['요일'] = data['날짜'].dt.weekday.map(weekday_map)
+        if '평일' not in data.columns:
+            data['평일'] = np.where(data['날짜'].dt.weekday < 5, '평일', '주말')
+    except Exception:
+        pass
+    
     # 필수 컬럼 확인 (유연하게 처리)
-    required_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '최저수요', '요일', '평일', '체감온도']
+    required_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '평일', '체감온도']
     missing_columns = [col for col in required_columns if col not in data.columns]
     
     if missing_columns:
         st.warning(f"⚠️ 일부 컬럼이 누락되었습니다: {missing_columns}")
         st.info("누락된 컬럼이 있어도 가능한 기능만 제공됩니다.")
         
-        # 최소한의 필수 컬럼만 확인
-        essential_columns = ['날짜', '최대수요', '최저수요']
+        # 최소한의 필수 컬럼만 확인 (최저수요 제외)
+        essential_columns = ['날짜', '최대수요']
         essential_missing = [col for col in essential_columns if col not in data.columns]
         
         if essential_missing:
             st.error(f"❌ 핵심 컬럼이 누락되었습니다: {essential_missing}")
-            st.info("최소한 날짜, 최대수요, 최저수요 컬럼은 필요합니다.")
+            st.info("최소한 날짜, 최대수요 컬럼은 필요합니다.")
             st.stop()
     
     # 가스수요 데이터 확인
@@ -867,28 +932,21 @@ st.markdown("---")
 st.header("🔧 Step 2: 특징 공학 및 데이터 정제")
 with st.spinner("특징 공학을 수행 중..."):
     data['월'] = data['날짜'].dt.month
-    # 요일과 평일 컬럼이 있으면 원핫 인코딩, 없으면 기본값 생성
-    if '요일' in data.columns:
-        data_processed = pd.get_dummies(data, columns=['요일'], drop_first=True)
-    else:
-        st.warning("⚠️ '요일' 컬럼이 없어 기본 요일 특징을 생성합니다.")
-        # 기본 요일 특징 생성 (월요일 기준)
-        data_processed['요일_월요일'] = 1
-        data_processed['요일_화요일'] = 0
-        data_processed['요일_수요일'] = 0
-        data_processed['요일_목요일'] = 0
-        data_processed['요일_금요일'] = 0
-        data_processed['요일_토요일'] = 0
-        data_processed['요일_일요일'] = 0
+    data['일'] = data['날짜'].dt.day
+    data['연도'] = data['날짜'].dt.year
+    # 공휴일 플래그는 사용하지 않음 (평일 컬럼 '평일/휴일'에 통합)
     
-    if '평일' in data.columns:
-        data_processed = pd.get_dummies(data, columns=['평일'], drop_first=True)
-    else:
-        st.warning("⚠️ '평일' 컬럼이 없어 기본 평일 특징을 생성합니다.")
-        # 기본 평일 특징 생성 (평일 기준)
-        data_processed['평일_평일'] = 1
+    # 요일 더미 생성, 평일은 수동 이진 플래그로 처리(값: '평일' 또는 '휴일')
+    data_processed = pd.get_dummies(data, columns=['요일'], drop_first=True)
+    try:
+        if '평일' in data.columns:
+            data_processed['평일_평일'] = (data['평일'].astype(str) == '평일').astype(int)
+        else:
+            # 백업: 요일로 추정 (주말이면 0)
+            data_processed['평일_평일'] = (data['날짜'].dt.weekday < 5).astype(int)
+    except Exception:
+        data_processed['평일_평일'] = 0
     data_processed['어제의_최대수요'] = data_processed['최대수요'].shift(1)
-    data_processed['어제의_최저수요'] = data_processed['최저수요'].shift(1)
     
     # 계절별 온도 특징 생성 (유연하게 처리)
     try:
@@ -898,16 +956,53 @@ with st.spinner("특징 공학을 수행 중..."):
         # 체감온도가 있으면 사용, 없으면 최고기온/최저기온만 사용
         if '체감온도' in data_processed.columns:
             data_processed['온도특징_최대'] = np.where(is_summer_mask, data_processed['체감온도'], data_processed['최고기온'])
-            data_processed['온도특징_최저'] = np.where(is_winter_mask, data_processed['체감온도'], data_processed['최저기온'])
             st.success("✅ 체감온도를 포함한 온도 특징 생성 완료")
-        elif '최고기온' in data_processed.columns and '최저기온' in data_processed.columns:
-            # 체감온도가 없으면 최고기온/최저기온만 사용
+        elif '최고기온' in data_processed.columns:
+            # 체감온도가 없으면 최고기온만 사용
             data_processed['온도특징_최대'] = data_processed['최고기온']
-            data_processed['온도특징_최저'] = data_processed['최저기온']
-            st.warning("⚠️ 체감온도가 없어 최고기온/최저기온만 사용합니다.")
+            st.warning("⚠️ 체감온도가 없어 최고기온만 사용합니다.")
         else:
-            st.error("❌ 온도 관련 컬럼이 부족합니다. 최소한 최고기온, 최저기온이 필요합니다.")
+            st.error("❌ 온도 관련 컬럼이 부족합니다. 최소한 최고기온이 필요합니다.")
             st.stop()
+
+        # 추가 온도 파생: 일교차(최고-최저) (가능할 때)
+        try:
+            if '최고기온' in data_processed.columns and '최저기온' in data_processed.columns:
+                data_processed['일교차'] = pd.to_numeric(data_processed['최고기온'], errors='coerce') - pd.to_numeric(data_processed['최저기온'], errors='coerce')
+        except Exception:
+            pass
+
+        # 시차(Lag) 및 이동평균(롤링) 특징 (누설 방지: shift 사용)
+        try:
+            if '최대수요' in data_processed.columns:
+                data_processed['어제의_최대수요'] = data_processed['최대수요'].shift(1)
+                data_processed['7일평균_최대수요'] = data_processed['최대수요'].shift(1).rolling(window=7, min_periods=1).mean()
+                data_processed['14일평균_최대수요'] = data_processed['최대수요'].shift(1).rolling(window=14, min_periods=1).mean()
+                data_processed['전주동일요일_최대수요'] = data_processed['최대수요'].shift(7)
+        except Exception:
+            pass
+
+        # 최신 관측 기반 동적 입력 기본값 저장 (예측 시 사용)
+        try:
+            st.session_state.dynamic_max_features = {
+                '어제의_최대수요': float(data_processed['어제의_최대수요'].dropna().iloc[-1]) if '어제의_최대수요' in data_processed.columns and data_processed['어제의_최대수요'].notna().any() else 0.0,
+                '7일평균_최대수요': float(data_processed['7일평균_최대수요'].dropna().iloc[-1]) if '7일평균_최대수요' in data_processed.columns and data_processed['7일평균_최대수요'].notna().any() else 0.0,
+                '14일평균_최대수요': float(data_processed['14일평균_최대수요'].dropna().iloc[-1]) if '14일평균_최대수요' in data_processed.columns and data_processed['14일평균_최대수요'].notna().any() else 0.0,
+                '전주동일요일_최대수요': float(data_processed['전주동일요일_최대수요'].dropna().iloc[-1]) if '전주동일요일_최대수요' in data_processed.columns and data_processed['전주동일요일_최대수요'].notna().any() else 0.0,
+            }
+            # 재귀 예측을 위한 최근 14일 타깃 시계열 저장
+            try:
+                st.session_state.max_series_tail = list(pd.to_numeric(data_processed['최대수요'], errors='coerce').dropna().tail(14).values)
+            except Exception:
+                st.session_state.max_series_tail = []
+        except Exception:
+            st.session_state.dynamic_max_features = {
+                '어제의_최대수요': 0.0,
+                '7일평균_최대수요': 0.0,
+                '14일평균_최대수요': 0.0,
+                '전주동일요일_최대수요': 0.0,
+            }
+            st.session_state.max_series_tail = []
             
     except Exception as e:
         st.error(f"❌ 온도 특징 생성 중 오류: {e}")
@@ -984,24 +1079,10 @@ with st.spinner("특징 공학을 수행 중..."):
     else:
         st.success("✅ 전력수요 데이터 정제 완료!")
     
-    # 핵심 학습 피처 위주로 결측 제거 (유연하게 처리)
-    essential_cols = ['최대수요','최저수요','월','어제의_최대수요','어제의_최저수요']
-    
-    # 온도 관련 컬럼이 있으면 추가
-    if '온도특징_최대' in data_processed.columns:
-        essential_cols.append('온도특징_최대')
-    if '온도특징_최저' in data_processed.columns:
-        essential_cols.append('온도특징_최저')
-    
-    # 실제 존재하는 컬럼만 필터링
-    available_essential_cols = [c for c in essential_cols if c in data_processed.columns]
-    
-    if len(available_essential_cols) >= 3:  # 최소 3개 컬럼은 필요
-        data_processed.dropna(subset=available_essential_cols, inplace=True)
-        st.success(f"✅ {len(available_essential_cols)}개 핵심 컬럼으로 데이터 정제 완료")
-    else:
-        st.error("❌ 핵심 컬럼이 너무 적습니다. 최소한 최대수요, 최저수요, 월 컬럼이 필요합니다.")
-        st.stop()
+    # 핵심 학습 피처 위주로 결측 제거 (불필요한 전체 드랍 방지)
+    essential_cols = ['최대수요','태양광최대','최고기온','평균기온','체감온도','월','어제의_최대수요','7일평균_최대수요','14일평균_최대수요','전주동일요일_최대수요']
+    essential_cols = [c for c in essential_cols if c in data_processed.columns]
+    data_processed.dropna(subset=essential_cols, inplace=True)
     
     # 처리된 데이터 정보
     col1, col2 = st.columns(2)
@@ -1016,53 +1097,52 @@ with st.spinner("특징 공학을 수행 중..."):
 
 st.markdown("---")
 
-# --- 3. 모델별 변수 및 데이터 분리 ---
-st.header("🎯 Step 3: 모델별 변수 및 데이터 분리")
+# --- 3. 모델 변수 및 데이터 분리 ---
+st.header("🎯 Step 3: 모델 변수 및 데이터 분리")
 
 # 평균기온을 모델 특징에 사용하지 않음 (향후 필요 시 True로 변경할 수 있도록 변수만 유지)
 include_avg_temp_feature = False
 
 # [최대수요 모델] (여름철에는 체감온도 사용)
-_base_max = ['온도특징_최대', '월', '어제의_최대수요']
+_base_max = ['온도특징_최대', '월', '어제의_최대수요', '7일평균_최대수요', '14일평균_최대수요', '전주동일요일_최대수요']
 if include_avg_temp_feature:
     _base_max.insert(1, '평균기온')
-features_max = _base_max + [col for col in data_processed if '요일_' in col or '평일_' in col]
+
+# 추가로 최저/최고/체감/일교차까지 함께 사용 (존재하는 경우만)
+_temp_extras = [f for f in ['최고기온', '최저기온', '체감온도', '일교차'] if f in data_processed.columns]
+
+# 요일, 평일 더미 포함
+_dummies = [col for col in data_processed if col.startswith('요일_') or col.startswith('평일_')]
+
+features_max = _base_max + _temp_extras + _dummies
 X_max = data_processed[features_max]
 y_max = data_processed['최대수요']
 
-# [최저수요 모델] (겨울철에는 체감온도 사용)
-_base_min = ['온도특징_최저', '월', '어제의_최저수요']
-if include_avg_temp_feature:
-    _base_min.insert(1, '평균기온')
-features_min = _base_min + [col for col in data_processed if '요일_' in col or '평일_' in col]
-X_min = data_processed[features_min]
-y_min = data_processed['최저수요']
+# 최저수요 모델 제거 - 최대수요 모델만 사용
 
 # 고정된 파라미터 사용
 test_size = 0.2
 n_estimators = 100
 random_state = 42
 
-# 랜덤 분할로 복구
-X_max_train, X_max_test, y_max_train, y_max_test = train_test_split(
-    X_max, y_max, test_size=test_size, random_state=random_state
-)
-X_min_train, X_min_test, y_min_train, y_min_test = train_test_split(
-    X_min, y_min, test_size=test_size, random_state=random_state
+# 단일 모델용 데이터 분할 - 시간순 분할 (평일/주말 분리 제거)
+X_max_train, X_max_test, y_max_train, y_max_test = chronological_split(
+    X_max, y_max, data_processed['날짜'], test_size=test_size
 )
 
 # 변수 정보 표시
 st.subheader("📈 최대수요 모델 변수")
 st.write(f"특징 변수: {len(features_max)}개")
+# 표시용 이름 매핑: '온도특징_최대' → '체감온도'
+display_features_max = [
+    ('체감온도' if name == '온도특징_최대' else name)
+    for name in features_max
+]
 # 헤더 행을 사용한 한 줄 표
-max_vars_df = pd.DataFrame([features_max], columns=[f'변수{i+1}' for i in range(len(features_max))])
+max_vars_df = pd.DataFrame([display_features_max], columns=[f'변수{i+1}' for i in range(len(display_features_max))])
 st.dataframe(max_vars_df, use_container_width=True)
 
-st.subheader("📉 최저수요 모델 변수")
-st.write(f"특징 변수: {len(features_min)}개")
-# 헤더 행을 사용한 한 줄 표
-min_vars_df = pd.DataFrame([features_min], columns=[f'변수{i+1}' for i in range(len(features_min))])
-st.dataframe(min_vars_df, use_container_width=True)
+
 
 # 가스수요 모델 변수 (가능한 경우)
 if '가스수요' in data_processed.columns and '태양광최대' in data_processed.columns:
@@ -1085,9 +1165,9 @@ if '가스수요' in data_processed.columns and '태양광최대' in data_proces
         X_gas = data_processed[available_gas_features]
         y_gas = data_processed['가스수요']
         
-        # 가스수요 데이터 분할 (랜덤)
-        X_gas_train, X_gas_test, y_gas_train, y_gas_test = train_test_split(
-            X_gas, y_gas, test_size=test_size, random_state=random_state
+        # 가스수요 데이터 분할 - 시간순 분할
+        X_gas_train, X_gas_test, y_gas_train, y_gas_test = chronological_split(
+            X_gas, y_gas, data_processed.loc[X_gas.index, '날짜'], test_size=test_size
         )
         
         st.write(f"특징 변수: {len(available_gas_features)}개")
@@ -1119,11 +1199,11 @@ if '가스수요' in data_processed.columns and '태양광최대' in data_proces
 
             # 최소 표본 확인 후 분할
             if len(X_gas_wd) >= 20 and len(X_gas_we) >= 20:
-                X_gas_wd_tr, X_gas_wd_te, y_gas_wd_tr, y_gas_wd_te = train_test_split(
-                    X_gas_wd, y_gas_wd, test_size=test_size, random_state=random_state
+                X_gas_wd_tr, X_gas_wd_te, y_gas_wd_tr, y_gas_wd_te = chronological_split(
+                    X_gas_wd, y_gas_wd, data_processed.loc[X_gas_wd.index, '날짜'], test_size=test_size
                 )
-                X_gas_we_tr, X_gas_we_te, y_gas_we_tr, y_gas_we_te = train_test_split(
-                    X_gas_we, y_gas_we, test_size=test_size, random_state=random_state
+                X_gas_we_tr, X_gas_we_te, y_gas_we_tr, y_gas_we_te = chronological_split(
+                    X_gas_we, y_gas_we, data_processed.loc[X_gas_we.index, '날짜'], test_size=test_size
                 )
 
                 st.session_state.X_gas_train_weekday = X_gas_wd_tr
@@ -1146,12 +1226,15 @@ else:
 
 st.markdown("---")
 
-# --- 4. 모델 학습 ---
+# --- 4. 모델 학습 (단일 모델) ---
 st.header("🤖 Step 4: 모델 학습")
 with st.spinner("모델을 학습 중..."):
-    rf_max = train_rf_model(X_max_train, y_max_train, n_estimators=n_estimators, random_state=random_state)
-    
-    rf_min = train_rf_model(X_min_train, y_min_train, n_estimators=n_estimators, random_state=random_state)
+    st.subheader("📈 단일 모델 학습")
+    # 단일 모델 학습 (간단 튜닝 적용)
+    try:
+        rf_max = tune_rf_model(X_max_train, y_max_train, random_state=random_state)
+    except Exception:
+        rf_max = train_rf_model(X_max_train, y_max_train, n_estimators=n_estimators, random_state=random_state)
     
     # 가스수요 모델 학습 (단일 모델로 고정)
     if hasattr(st.session_state, 'features_gas'):
@@ -1189,14 +1272,10 @@ st.markdown("---")
 # --- 5. 모델 성능 평가 ---
 st.header("📊 Step 5: 모델 성능 평가")
 with st.spinner("성능을 평가 중..."):
-    y_max_pred = rf_max.predict(X_max_test)
-    y_min_pred = rf_min.predict(X_min_test)
-    
-    # 전역 변수 업데이트
-    st.session_state.mae_max = mean_absolute_error(y_max_test, y_max_pred)
-    st.session_state.r2_max = r2_score(y_max_test, y_max_pred)
-    st.session_state.mae_min = mean_absolute_error(y_min_test, y_min_pred)
-    st.session_state.r2_min = r2_score(y_min_test, y_min_pred)
+    st.subheader("📈 단일 모델 성능 (검증 세트)")
+    y_pred = rf_max.predict(X_max_test)
+    st.session_state.mae_max = mean_absolute_error(y_max_test, y_pred)
+    st.session_state.r2_max = r2_score(y_max_test, y_pred)
     
     # 가스수요 단일 모델 성능 평가
     if hasattr(st.session_state, 'gas_model') and hasattr(st.session_state, 'X_gas_test'):
@@ -1204,42 +1283,29 @@ with st.spinner("성능을 평가 중..."):
         st.session_state.mae_gas = mean_absolute_error(st.session_state.y_gas_test, y_gas_pred)
         st.session_state.r2_gas = r2_score(st.session_state.y_gas_test, y_gas_pred)
 
-# 성능 결과 표시
-if hasattr(st.session_state, 'gas_model'):
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.subheader("📈 최대수요 예측 모델 성능")
-        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_max:,.0f} MW")
-        st.metric("결정 계수 (R²)", f"{st.session_state.r2_max:.4f}")
-    
-    with col2:
-        st.subheader("📉 최저수요 예측 모델 성능")
-        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_min:,.0f} MW")
-        st.metric("결정 계수 (R²)", f"{st.session_state.r2_min:.4f}")
-    
-    with col3:
-        st.subheader("🔥 가스수요 예측 모델 성능")
-        st.metric("MAE", f"{st.session_state.mae_gas:,.0f} MW")
-        st.metric("R²", f"{st.session_state.r2_gas:.4f}")
-else:
+# 성능 결과 표시 (최대수요 / 가스수요 나란히)
+if hasattr(st.session_state, 'mae_gas') and hasattr(st.session_state, 'r2_gas'):
     col1, col2 = st.columns(2)
-    
     with col1:
         st.subheader("📈 최대수요 예측 모델 성능")
-        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_max:,.0f} MW")
-        st.metric("결정 계수 (R²)", f"{st.session_state.r2_max:.4f}")
-    
+        st.metric("검증 MAE", f"{st.session_state.mae_max:,.0f} MW")
+        st.metric("검증 R²", f"{st.session_state.r2_max:.4f}")
     with col2:
-        st.subheader("📉 최저수요 예측 모델 성능")
-        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_min:,.0f} MW")
-        st.metric("결정 계수 (R²)", f"{st.session_state.r2_min:.4f}")
+        st.subheader("🔥 가스수요 예측 모델 성능")
+        st.metric("검증 MAE", f"{st.session_state.mae_gas:,.0f} MW")
+        st.metric("검증 R²", f"{st.session_state.r2_gas:.4f}")
+else:
+    st.subheader("📈 최대수요 예측 모델 성능")
+    st.metric("검증 MAE", f"{st.session_state.mae_max:,.0f} MW")
+    st.metric("검증 R²", f"{st.session_state.r2_max:.4f}")
+
+# 그래프 비표시(요청에 따라 검증 라인차트 생략)
 
 st.markdown("---")
 
 # --- 6. 전력 수요 예측 ---
 st.header("🔮 Step 6: 전력 수요 예측")
-st.info("요일과 평균기온을 입력하여 최대/최저 수요를 예측합니다.")
+st.info("요일과 체감온도를 입력하고 예측 기간을 선택하여 최대수요를 예측합니다.")
 
 # 예측 입력 폼
 col1, col2 = st.columns(2)
@@ -1258,6 +1324,8 @@ with col1:
     month_options = list(range(1, 13))
     selected_month = st.selectbox("월 선택", month_options, index=4)  # 5월 기본값
     
+    # 예측 기간은 1일로 고정
+    horizon = 1
     # 예측 버튼
     predict_button = st.button("🔮 예측 실행", type="primary")
 
@@ -1271,19 +1339,12 @@ with col2:
 if predict_button:
     try:
         with st.spinner("예측을 수행 중..."):
-            # 요일 원핫 인코딩
+            # 평일/주말 + 요일 더미 구성 (예측 입력)
             weekday_dummies = {}
-            for day in weekday_options:
-                if day == selected_weekday:
-                    weekday_dummies[f'요일_{day}'] = 1
-                else:
-                    weekday_dummies[f'요일_{day}'] = 0
-            
-            # 평일 여부 (주말이면 0, 평일이면 1)
-            is_weekday = 1 if selected_weekday in ['월요일', '화요일', '수요일', '목요일', '금요일'] else 0
-            
-            # 평일 원핫 인코딩
+            # 평일/휴일 판단: 요일 기반(월~금=평일). 추후 UI로 직접 선택 가능
+            is_weekday = 1 if selected_weekday in ['월요일','화요일','수요일','목요일','금요일'] else 0
             weekday_dummies['평일_평일'] = is_weekday
+            weekday_dummies.update({f'요일_{w}': (1 if w == selected_weekday else 0) for w in ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']})
             
             # 계절 판별
             is_summer_sel = selected_month in [5, 6, 7, 8, 9]
@@ -1291,81 +1352,126 @@ if predict_button:
 
             # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 체감온도 대용)
             est_high = feels_like_simple
+            # 동적 입력값(최근 관측)을 세션에서 읽어와 자동 주입
+            dyn = st.session_state.get('dynamic_max_features', {})
             max_features = {
                 '온도특징_최대': feels_like_simple if is_summer_sel else est_high,
                 '월': selected_month,
-                '어제의_최대수요': 50000  # 기본값 (실제로는 이전 데이터 필요)
+                # 동적 입력 자동 주입 (최근 관측치)
+                '어제의_최대수요': dyn.get('어제의_최대수요', 0.0),
+                '7일평균_최대수요': dyn.get('7일평균_최대수요', 0.0),
+                '14일평균_최대수요': dyn.get('14일평균_최대수요', 0.0),
+                '전주동일요일_최대수요': dyn.get('전주동일요일_최대수요', 0.0),
+                # 추가 온도 입력(간단 모드에서는 동일 값으로 채움)
+                '최고기온': feels_like_simple,
+                '최저기온': feels_like_simple,
+                '체감온도': feels_like_simple,
+                '일교차': 0.0,
             }
             max_features.update(weekday_dummies)
             
-            # 최저수요 예측을 위한 특징 생성 (겨울: 체감온도, 그 외: 체감온도 대용)
-            est_low = feels_like_simple
-            min_features = {
-                '온도특징_최저': feels_like_simple if is_winter_sel else est_low,
-                '월': selected_month,
-                '어제의_최저수요': 30000  # 기본값 (실제로는 이전 데이터 필요)
-            }
-            min_features.update(weekday_dummies)
+            # 모델 선택(단일 모델)
+            model_max = rf_max
             
-            # 특징 순서 맞추기
-            max_input = pd.DataFrame([max_features])
-            min_input = pd.DataFrame([min_features])
-            
-            # 필요한 컬럼만 선택
-            max_input = max_input[features_max]
-            min_input = min_input[features_min]
-            
-            # 예측 실행
-            predicted_max = rf_max.predict(max_input)[0]
-            predicted_min = rf_min.predict(min_input)[0]
+            def predict_one_day(feels_like_val: float, month_val: int, weekday_name: str, dyn_feats: dict) -> float:
+                dummies = {'평일_평일': 1 if weekday_name in ['월요일','화요일','수요일','목요일','금요일'] else 0}
+                dummies.update({f'요일_{w}': (1 if w == weekday_name else 0) for w in ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']})
+                feats = {
+                    '온도특징_최대': feels_like_val if month_val in [5,6,7,8,9] else feels_like_val,
+                    '월': month_val,
+                    '어제의_최대수요': dyn_feats.get('어제의_최대수요', 0.0),
+                    '7일평균_최대수요': dyn_feats.get('7일평균_최대수요', 0.0),
+                    '14일평균_최대수요': dyn_feats.get('14일평균_최대수요', 0.0),
+                    '전주동일요일_최대수요': dyn_feats.get('전주동일요일_최대수요', 0.0),
+                    '최고기온': feels_like_val,
+                    '최저기온': feels_like_val,
+                    '체감온도': feels_like_val,
+                    '일교차': 0.0,
+                }
+                feats.update(dummies)
+                frame = pd.DataFrame([feats])
+                # 훈련 피처 집합과 정렬/보정
+                frame = align_features_for_model(model_max, frame)
+                return float(model_max.predict(frame)[0])
+
+            # 단일일 예측 또는 재귀 7일 예측
+            if horizon == 1:
+                predicted_max = predict_one_day(feels_like_simple, selected_month, selected_weekday, dyn)
+                forecast_series = [predicted_max]
+            else:
+                # 7일 재귀 예측: 매 스텝에서 래그/평균 업데이트
+                weekday_cycle = ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']
+                start_idx = weekday_cycle.index(selected_weekday)
+                # 시드 시계열 준비
+                tail = st.session_state.get('max_series_tail', [])
+                buf = list(tail)
+                if len(buf) < 14:
+                    buf = ([buf[0]] * (14 - len(buf)) + buf) if buf else [0.0]*14
+                forecast_series = []
+                dyn_work = dyn.copy()
+                for step in range(7):
+                    wd_name = weekday_cycle[(start_idx + step) % 7]
+                    y_hat = predict_one_day(feels_like_simple, selected_month, wd_name, dyn_work)
+                    forecast_series.append(y_hat)
+                    # 버퍼 업데이트 (최대 14개 유지)
+                    buf.append(y_hat)
+                    if len(buf) > 14:
+                        buf.pop(0)
+                    # 동적 특징 업데이트
+                    dyn_work['어제의_최대수요'] = buf[-1]
+                    dyn_work['7일평균_최대수요'] = float(pd.Series(buf[-7:]).mean())
+                    dyn_work['14일평균_최대수요'] = float(pd.Series(buf[-14:]).mean())
+                    dyn_work['전주동일요일_최대수요'] = buf[-7] if len(buf) >= 7 else dyn_work.get('전주동일요일_최대수요', 0.0)
+                predicted_max = forecast_series[0]
             
             st.success("✅ 예측 완료!")
             
             # 예측 결과 표시
             st.subheader("🎯 예측 결과")
             
-            col1, col2 = st.columns(2)
-            with col1:
+            if horizon == 1:
                 st.metric("예측 최대수요", f"{predicted_max:,.0f} MW")
-            with col2:
-                st.metric("예측 최저수요", f"{predicted_min:,.0f} MW")
+            else:
+                st.write("**예측 최대수요(7일):**")
+                st.dataframe(pd.DataFrame({
+                    '일차': list(range(1, len(forecast_series)+1)),
+                    '예측 최대수요': [f"{v:,.0f}" for v in forecast_series]
+                }), use_container_width=True)
             
             # 예측 결과 상세 정보
             st.subheader("📋 예측 상세 정보")
-            prediction_info = pd.DataFrame({
-                '항목': ['요일', '체감온도', '월', '예측 최대수요', '예측 최저수요', '수요 차이'],
-                '값': [selected_weekday, f"{feels_like_simple}°C", f"{selected_month}월", 
-                      f"{predicted_max:,.0f} MW", f"{predicted_min:,.0f} MW", 
-                      f"{predicted_max - predicted_min:,.0f} MW"]
-            })
+            base_items = ['요일', '체감온도', '월']
+            base_vals = [selected_weekday, f"{feels_like_simple}°C", f"{selected_month}월"]
+            if horizon == 1:
+                base_items.append('예측 최대수요')
+                base_vals.append(f"{predicted_max:,.0f} MW")
+            else:
+                base_items.append('예측 기간')
+                base_vals.append(f"{horizon}일")
+            prediction_info = pd.DataFrame({'항목': base_items, '값': base_vals})
             st.dataframe(prediction_info, use_container_width=True)
             
             # 예측 신뢰도 (모델 성능 기반)
             confidence_max = min(95, max(60, st.session_state.r2_max * 100))
-            confidence_min = min(95, max(60, st.session_state.r2_min * 100))
             
             st.subheader("📊 예측 신뢰도")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("최대수요 예측 신뢰도", f"{confidence_max:.1f}%")
-            with col2:
-                st.metric("최저수요 예측 신뢰도", f"{confidence_min:.1f}%")
+            st.metric("최대수요 예측 신뢰도", f"{confidence_max:.1f}%")
             
             # 예측 결과 시각화
             st.subheader("📈 예측 결과 시각화")
             
             fig_prediction = go.Figure()
             
-            # 최대수요와 최저수요를 막대 그래프로 표시
+            # 최대수요만 막대 그래프로 표시
             fig_prediction.add_trace(go.Bar(
-                x=['최대수요', '최저수요'],
-                y=[predicted_max, predicted_min],
-                name='예측 수요',
-                marker_color=['red', 'blue']
+                x=['최대수요'],
+                y=[predicted_max],
+                name='예측 최대수요',
+                marker_color=['red']
             ))
             
             fig_prediction.update_layout(
-                title=f"{selected_weekday} (체감 {feels_like_simple}°C) 전력 수요 예측",
+                title=f"{selected_weekday} (체감 {feels_like_simple}°C) 최대수요 예측",
                 yaxis_title="전력 수요 (MW)",
                 showlegend=True
             )
@@ -1379,7 +1485,7 @@ if predict_button:
 # --- 새로운 예측 기능: 최저기온/최고기온 입력 ---
 st.markdown("---")
 st.subheader("🌡️ 상세 기온 기반 예측")
-st.info("최저기온, 최고기온, 체감온도를 직접 입력하여 더 정확한 예측을 수행합니다.")
+st.info("최저기온, 최고기온, 체감온도를 직접 입력하여 더 정확한 최대수요 예측을 수행합니다.")
 
 # 새로운 예측 입력 폼
 col1, col2 = st.columns(2)
@@ -1387,8 +1493,8 @@ col1, col2 = st.columns(2)
 with col1:
     st.subheader("📝 상세 예측 조건 입력")
     
-    # 요일 선택 (기존과 동일)
-    selected_weekday_detailed = st.selectbox("요일 선택", weekday_options, index=0, key="weekday_detailed")
+    # 요일 선택 (상세)
+    selected_weekday_detailed = st.selectbox("요일 선택", ['월요일','화요일','수요일','목요일','금요일','토요일','일요일'], index=0, key="weekday_detailed")
     
     # 최저기온 입력
     min_temp = st.number_input("최저기온 (°C)", min_value=-50.0, max_value=50.0, value=15.0, step=0.1, key="min_temp")
@@ -1411,111 +1517,88 @@ with col2:
     st.write(f"**최저기온:** {min_temp}°C")
     st.write(f"**최고기온:** {max_temp}°C")
     st.write(f"**체감온도:** {feels_like_detailed}°C")
-    st.write(f"**평균기온:** {(min_temp + max_temp) / 2:.1f}°C")
+
     st.write(f"**선택된 월:** {selected_month_detailed}월")
 
 # 상세 예측 실행
 if predict_detailed_button:
     try:
         with st.spinner("상세 예측을 수행 중..."):
-            # 평균기온 계산
-            avg_temp_detailed = (min_temp + max_temp) / 2
+
             
-            # 요일 원핫 인코딩
+            # 평일/주말 + 요일 더미 구성 (상세 예측 입력)
             weekday_dummies_detailed = {}
-            for day in weekday_options:
-                if day == selected_weekday_detailed:
-                    weekday_dummies_detailed[f'요일_{day}'] = 1
-                else:
-                    weekday_dummies_detailed[f'요일_{day}'] = 0
-            
-            # 평일 여부 (주말이면 0, 평일이면 1)
-            is_weekday_detailed = 1 if selected_weekday_detailed in ['월요일', '화요일', '수요일', '목요일', '금요일'] else 0
-            
-            # 평일 원핫 인코딩
+            # 평일/휴일 판단: 요일 기반
+            is_weekday_detailed = 1 if selected_weekday_detailed in ['월요일','화요일','수요일','목요일','금요일'] else 0
             weekday_dummies_detailed['평일_평일'] = is_weekday_detailed
+            weekday_dummies_detailed.update({f'요일_{w}': (1 if w == selected_weekday_detailed else 0) for w in ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']})
             
             # 계절 판별
             is_summer_detailed = selected_month_detailed in [5, 6, 7, 8, 9]
             is_winter_detailed = selected_month_detailed in [10, 11, 12, 1, 2, 3, 4]
 
             # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 실제 최고기온)
+            dyn = st.session_state.get('dynamic_max_features', {})
             max_features_detailed = {
                 '온도특징_최대': feels_like_detailed if is_summer_detailed else max_temp,
-                '평균기온': avg_temp_detailed,
                 '월': selected_month_detailed,
-                '어제의_최대수요': 50000  # 기본값
+                '어제의_최대수요': dyn.get('어제의_최대수요', 0.0),
+                '7일평균_최대수요': dyn.get('7일평균_최대수요', 0.0),
+                '14일평균_최대수요': dyn.get('14일평균_최대수요', 0.0),
+                '전주동일요일_최대수요': dyn.get('전주동일요일_최대수요', 0.0),
+                # 세부 온도 입력 반영
+                '최고기온': max_temp,
+                '최저기온': min_temp,
+                '체감온도': feels_like_detailed,
+                '일교차': max_temp - min_temp,
             }
             max_features_detailed.update(weekday_dummies_detailed)
             
-            # 최저수요 예측을 위한 특징 생성 (겨울: 체감온도, 그 외: 실제 최저기온)
-            min_features_detailed = {
-                '온도특징_최저': feels_like_detailed if is_winter_detailed else min_temp,
-                '평균기온': avg_temp_detailed,
-                '월': selected_month_detailed,
-                '어제의_최저수요': 30000  # 기본값
-            }
-            min_features_detailed.update(weekday_dummies_detailed)
-            
-            # 특징 순서 맞추기
+            # 단일 모델 선택 후 피처 정렬/보정
+            model_max_detailed = rf_max
             max_input_detailed = pd.DataFrame([max_features_detailed])
-            min_input_detailed = pd.DataFrame([min_features_detailed])
-            
-            # 필요한 컬럼만 선택
-            max_input_detailed = max_input_detailed[features_max]
-            min_input_detailed = min_input_detailed[features_min]
+            max_input_detailed = align_features_for_model(model_max_detailed, max_input_detailed)
             
             # 예측 실행
-            predicted_max_detailed = rf_max.predict(max_input_detailed)[0]
-            predicted_min_detailed = rf_min.predict(min_input_detailed)[0]
+            predicted_max_detailed = model_max_detailed.predict(max_input_detailed)[0]
             
             st.success("✅ 상세 예측 완료!")
             
             # 예측 결과 표시
             st.subheader("🎯 상세 예측 결과")
             
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("예측 최대수요", f"{predicted_max_detailed:,.0f} MW")
-            with col2:
-                st.metric("예측 최저수요", f"{predicted_min_detailed:,.0f} MW")
+            st.metric("예측 최대수요", f"{predicted_max_detailed:,.0f} MW")
             
             # 예측 결과 상세 정보
             st.subheader("📋 상세 예측 상세 정보")
             prediction_info_detailed = pd.DataFrame({
-                '항목': ['요일', '최저기온', '최고기온', '체감온도', '평균기온', '월', '예측 최대수요', '예측 최저수요', '수요 차이'],
-                '값': [selected_weekday_detailed, f"{min_temp}°C", f"{max_temp}°C", f"{feels_like_detailed:.1f}°C", f"{avg_temp_detailed:.1f}°C", f"{selected_month_detailed}월", 
-                      f"{predicted_max_detailed:,.0f} MW", f"{predicted_min_detailed:,.0f} MW", 
-                      f"{predicted_max_detailed - predicted_min_detailed:,.0f} MW"]
+                '항목': ['요일', '최저기온', '최고기온', '체감온도', '월', '예측 최대수요'],
+                '값': [selected_weekday_detailed, f"{min_temp}°C", f"{max_temp}°C", f"{feels_like_detailed:.1f}°C", f"{selected_month_detailed}월", 
+                      f"{predicted_max_detailed:,.0f} MW"]
             })
             st.dataframe(prediction_info_detailed, use_container_width=True)
             
             # 예측 신뢰도 (모델 성능 기반)
             confidence_max_detailed = min(95, max(60, st.session_state.r2_max * 100))
-            confidence_min_detailed = min(95, max(60, st.session_state.r2_min * 100))
             
             st.subheader("📊 상세 예측 신뢰도")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("최대수요 예측 신뢰도", f"{confidence_max_detailed:.1f}%")
-            with col2:
-                st.metric("최저수요 예측 신뢰도", f"{confidence_min_detailed:.1f}%")
+            st.metric("최대수요 예측 신뢰도", f"{confidence_max_detailed:.1f}%")
             
             # 상세 예측 결과 시각화
             st.subheader("📈 상세 예측 결과 시각화")
             
             fig_prediction_detailed = go.Figure()
             
-            # 최대수요와 최저수요를 막대 그래프로 표시
+            # 최대수요만 막대 그래프로 표시
             fig_prediction_detailed.add_trace(go.Bar(
-                x=['최대수요', '최저수요'],
-                y=[predicted_max_detailed, predicted_min_detailed],
-                name='상세 예측 수요',
-                marker_color=['red', 'blue']
+                x=['최대수요'],
+                y=[predicted_max_detailed],
+                name='상세 예측 최대수요',
+                marker_color=['red']
             ))
             
             fig_prediction_detailed.update_layout(
-                title=f"{selected_weekday_detailed} (최저:{min_temp}°C, 최고:{max_temp}°C) 전력 수요 예측",
+                title=f"{selected_weekday_detailed} (최저:{min_temp}°C, 최고:{max_temp}°C) 최대수요 예측",
                 yaxis_title="전력 수요 (MW)",
                 showlegend=True
             )
