@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -380,7 +381,7 @@ def load_data_from_sheet(client, sheet_name="power_data", sheet_id=None):
         df = pd.DataFrame(data_rows, columns=headers)
         
         # 수치형 컬럼 변환
-        numeric_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '최저수요']
+        numeric_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '최저수요', '체감온도']
         for col in numeric_columns:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -820,12 +821,12 @@ with st.spinner("데이터를 전처리 중..."):
         st.stop()
     
     # 필수 컬럼 확인
-    required_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '최저수요', '요일', '평일']
+    required_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '최저수요', '요일', '평일', '체감온도']
     missing_columns = [col for col in required_columns if col not in data.columns]
     
     if missing_columns:
         st.error(f"❌ 필수 컬럼이 누락되었습니다: {missing_columns}")
-        st.info("필수 컬럼: 날짜, 최고기온, 평균기온, 최저기온, 최대수요, 최저수요, 요일, 평일")
+        st.info("필수 컬럼: 날짜, 최고기온, 평균기온, 최저기온, 최대수요, 최저수요, 요일, 평일, 체감온도")
         st.stop()
     
     # 가스수요 데이터 확인
@@ -860,6 +861,19 @@ with st.spinner("특징 공학을 수행 중..."):
     data_processed['어제의_최대수요'] = data_processed['최대수요'].shift(1)
     data_processed['어제의_최저수요'] = data_processed['최저수요'].shift(1)
     
+    # 계절별 온도 특징 생성
+    try:
+        is_summer_mask = data_processed['월'].isin([5, 6, 7, 8, 9])
+        is_winter_mask = data_processed['월'].isin([10, 11, 12, 1, 2, 3, 4])
+        if '체감온도' not in data_processed.columns:
+            st.error("❌ '체감온도' 컬럼이 없습니다. 구글시트에 '체감온도' 열을 추가해 주세요.")
+            st.stop()
+        data_processed['온도특징_최대'] = np.where(is_summer_mask, data_processed['체감온도'], data_processed['최고기온'])
+        data_processed['온도특징_최저'] = np.where(is_winter_mask, data_processed['체감온도'], data_processed['최저기온'])
+    except Exception as e:
+        st.error(f"❌ 온도 특징 생성 중 오류: {e}")
+        st.stop()
+    
     # 가스수요 특징 공학
     if '가스수요' in data_processed.columns and '태양광최대' in data_processed.columns:
         # 가스수요 데이터를 숫자로 변환
@@ -871,13 +885,50 @@ with st.spinner("특징 공학을 수행 중..."):
                 data_processed['잔여부하'] = pd.to_numeric(data_processed['최대수요'], errors='coerce') - data_processed['태양광최대']
             except Exception:
                 pass
+            # 최대수요 대비 비율 특징들 (가스 제외, 누설 방지)
+            try:
+                denom = data_processed['최대수요'].replace(0, np.nan)
+                data_processed['최대수요대비_태양광비율'] = (data_processed['태양광최대'] / denom).fillna(0.0)
+                data_processed['최대수요대비_잔여부하비율'] = (data_processed['잔여부하'] / denom).fillna(0.0)
+            except Exception:
+                pass
+
+        # (가스+태양광)/최대수요 총비율의 평일/주말 평균을 계산하여 예산형 가스 기준치 생성
+        try:
+            denom_total = data_processed['최대수요'].replace(0, np.nan)
+            total_ratio = (data_processed['가스수요'] + data_processed['태양광최대']) / denom_total
+            # 평일 플래그 파생 (원-핫이 있으면 사용, 없으면 원본에서 유도)
+            if '평일_평일' in data_processed.columns:
+                is_weekday_series = data_processed['평일_평일']
+            else:
+                is_weekday_series = (data['평일'] == '평일').astype(int) if '평일' in data.columns else pd.Series(0, index=data_processed.index)
+
+            weekday_mean = total_ratio[is_weekday_series == 1].mean()
+            weekend_mean = total_ratio[is_weekday_series == 0].mean()
+            global_mean = total_ratio.mean()
+
+            if pd.isna(weekday_mean):
+                weekday_mean = global_mean
+            if pd.isna(weekend_mean):
+                weekend_mean = global_mean
+
+            # 세션에 저장 (예측 시 사용)
+            st.session_state.gas_total_ratio_weekday = float(weekday_mean) if not pd.isna(weekday_mean) else 0.0
+            st.session_state.gas_total_ratio_weekend = float(weekend_mean) if not pd.isna(weekend_mean) else 0.0
+
+            # 행별 예산 비율 선택 후 목표 가스량 계산: max*ratio - solar
+            ratio_used = np.where(is_weekday_series == 1, st.session_state.gas_total_ratio_weekday, st.session_state.gas_total_ratio_weekend)
+            data_processed['목표가스_예산'] = (data_processed['최대수요'] * ratio_used - data_processed['태양광최대']).clip(lower=0)
+        except Exception:
+            # 실패 시 컬럼 미생성
+            pass
         
         # 결측값 제거 후 특징 공학
         gas_data_clean = data_processed[['가스수요', '태양광최대']].dropna()
         if len(gas_data_clean) > 0:
             data_processed['어제의_가스수요'] = data_processed['가스수요'].shift(1)
-            data_processed['가스수요_변화율'] = data_processed['가스수요'].pct_change()
-            data_processed['태양광_가스_비율'] = data_processed['태양광최대'] / data_processed['가스수요'].replace(0, 1)
+            # 누설 방지: 변화율은 t시점이 아니라 (t-1,t-2)로 계산
+            data_processed['어제의_가스수요_변화율'] = data_processed['가스수요'].pct_change().shift(1)
             # 예측 시 사용하기 위한 최신 관측 래그 보관
             try:
                 last_two_gas = pd.to_numeric(gas_data_clean['가스수요'], errors='coerce').dropna().tail(2).values
@@ -912,17 +963,22 @@ st.markdown("---")
 # --- 3. 모델별 변수 및 데이터 분리 ---
 st.header("🎯 Step 3: 모델별 변수 및 데이터 분리")
 
-# [최대수요 모델]
-features_max = [
-    '최고기온', '평균기온', '월', '어제의_최대수요'
-] + [col for col in data_processed if '요일_' in col or '평일_' in col]
+# 평균기온을 모델 특징에 사용하지 않음 (향후 필요 시 True로 변경할 수 있도록 변수만 유지)
+include_avg_temp_feature = False
+
+# [최대수요 모델] (여름철에는 체감온도 사용)
+_base_max = ['온도특징_최대', '월', '어제의_최대수요']
+if include_avg_temp_feature:
+    _base_max.insert(1, '평균기온')
+features_max = _base_max + [col for col in data_processed if '요일_' in col or '평일_' in col]
 X_max = data_processed[features_max]
 y_max = data_processed['최대수요']
 
-# [최저수요 모델]
-features_min = [
-    '최저기온', '평균기온', '월', '어제의_최저수요'
-] + [col for col in data_processed if '요일_' in col or '평일_' in col]
+# [최저수요 모델] (겨울철에는 체감온도 사용)
+_base_min = ['온도특징_최저', '월', '어제의_최저수요']
+if include_avg_temp_feature:
+    _base_min.insert(1, '평균기온')
+features_min = _base_min + [col for col in data_processed if '요일_' in col or '평일_' in col]
 X_min = data_processed[features_min]
 y_min = data_processed['최저수요']
 
@@ -955,7 +1011,18 @@ st.dataframe(min_vars_df, use_container_width=True)
 # 가스수요 모델 변수 (가능한 경우)
 if '가스수요' in data_processed.columns and '태양광최대' in data_processed.columns:
     st.subheader("🔥 가스수요 모델 변수")
-    features_gas = ['최대수요', '태양광최대', '잔여부하', '어제의_가스수요', '가스수요_변화율', '태양광_가스_비율']
+    # 최소·핵심 피처 위주 구성 (다중공선성/누설 위험 낮춤)
+    features_gas = [
+        '최대수요',          # 총 스케일
+        '태양광최대',        # 대체관계 핵심
+        '잔여부하',          # 잔여 총량
+        '최대수요대비_태양광비율',
+        '최대수요대비_잔여부하비율',
+        '목표가스_예산',      # 평일/주말 총비율 예산
+        '어제의_가스수요',     # 래그
+        '어제의_가스수요_변화율',# 래그 변화율(누설 방지)
+        '평일_평일'          # 평일/주말 효과
+    ]
     available_gas_features = [col for col in features_gas if col in data_processed.columns]
     
     if len(available_gas_features) >= 2:  # 최소 2개 변수 필요
@@ -971,12 +1038,51 @@ if '가스수요' in data_processed.columns and '태양광최대' in data_proces
         gas_vars_df = pd.DataFrame([available_gas_features], columns=[f'변수{i+1}' for i in range(len(available_gas_features))])
         st.dataframe(gas_vars_df, use_container_width=True)
         
-        # 세션 상태에 저장
+        # 세션 상태에 저장 (단일 전체 세트)
         st.session_state.X_gas_train = X_gas_train
         st.session_state.X_gas_test = X_gas_test
         st.session_state.y_gas_train = y_gas_train
         st.session_state.y_gas_test = y_gas_test
         st.session_state.features_gas = available_gas_features
+
+        # 평일/주말 분리 세트 생성
+        if '평일_평일' in data_processed.columns:
+            try:
+                mask_weekday = data_processed['평일_평일'] == 1
+            except Exception:
+                mask_weekday = pd.Series(False, index=data_processed.index)
+        else:
+            # 원본 '평일'에서 유도
+            mask_weekday = (data['평일'] == '평일') if '평일' in data.columns else pd.Series(False, index=data_processed.index)
+
+        try:
+            X_gas_wd = X_gas[mask_weekday]
+            y_gas_wd = y_gas[mask_weekday]
+            X_gas_we = X_gas[~mask_weekday]
+            y_gas_we = y_gas[~mask_weekday]
+
+            # 최소 표본 확인 후 분할
+            if len(X_gas_wd) >= 20 and len(X_gas_we) >= 20:
+                X_gas_wd_tr, X_gas_wd_te, y_gas_wd_tr, y_gas_wd_te = train_test_split(
+                    X_gas_wd, y_gas_wd, test_size=test_size, random_state=random_state
+                )
+                X_gas_we_tr, X_gas_we_te, y_gas_we_tr, y_gas_we_te = train_test_split(
+                    X_gas_we, y_gas_we, test_size=test_size, random_state=random_state
+                )
+
+                st.session_state.X_gas_train_weekday = X_gas_wd_tr
+                st.session_state.X_gas_test_weekday = X_gas_wd_te
+                st.session_state.y_gas_train_weekday = y_gas_wd_tr
+                st.session_state.y_gas_test_weekday = y_gas_wd_te
+
+                st.session_state.X_gas_train_weekend = X_gas_we_tr
+                st.session_state.X_gas_test_weekend = X_gas_we_te
+                st.session_state.y_gas_train_weekend = y_gas_we_tr
+                st.session_state.y_gas_test_weekend = y_gas_we_te
+            else:
+                st.warning("⚠️ 평일/주말 분리 학습을 위한 표본 수가 부족합니다. 단일 모델로 학습합니다.")
+        except Exception:
+            st.warning("⚠️ 평일/주말 분리 데이터 생성 중 오류가 발생하여 단일 모델로 진행합니다.")
     else:
         st.warning("⚠️ 가스수요 예측을 위한 충분한 변수가 없습니다.")
 else:
@@ -991,33 +1097,71 @@ with st.spinner("모델을 학습 중..."):
     
     rf_min = train_rf_model(X_min_train, y_min_train, n_estimators=n_estimators, random_state=random_state)
     
-    # 가스수요 모델 학습 (가능한 경우) - LightGBM + 단조 제약
-    if hasattr(st.session_state, 'X_gas_train'):
-        # 단조 제약 설정: 최대수요(+1), 태양광최대(-1), 어제의_가스수요(+1), 그 외(0)
+    # 가스수요 모델 학습 (가능한 경우) - 분리 모델 우선, 불가 시 단일 모델
+    if hasattr(st.session_state, 'features_gas'):
         features_for_constraints = st.session_state.features_gas
-        # 핵심 변수만 단조 제약 적용(과제약 방지)
         constraint_map = {
             '최대수요': 1,
             '태양광최대': -1,
             '잔여부하': 1,
+            '최대수요대비_태양광비율': -1,
+            '최대수요대비_잔여부하비율': 1,
+            '목표가스_예산': 1,
             '어제의_가스수요': 0,
-            '가스수요_변화율': 0,
-            '태양광_가스_비율': 0,
+            '어제의_가스수요_변화율': 0,
+            '평일_평일': 0,
         }
         monotone_constraints = [constraint_map.get(f, 0) for f in features_for_constraints]
 
-        # 캐시된 학습 사용
-        st.session_state.gas_model = train_lgbm_gas_model(
-            st.session_state.X_gas_train,
-            st.session_state.y_gas_train,
-            monotone_constraints=monotone_constraints,
-            n_estimators=300,
-            learning_rate=0.05,
-            num_leaves=63,
-            min_child_samples=10,
-            random_state=random_state,
-        )
-        st.success("✅ 전력수요 및 가스수요 모델 학습 완료! (LightGBM + 단조 제약)")
+        trained_any = False
+        # 주중 모델
+        if hasattr(st.session_state, 'X_gas_train_weekday'):
+            st.session_state.gas_model_weekday = train_lgbm_gas_model(
+                st.session_state.X_gas_train_weekday,
+                st.session_state.y_gas_train_weekday,
+                monotone_constraints=monotone_constraints,
+                n_estimators=300,
+                learning_rate=0.05,
+                num_leaves=63,
+                min_child_samples=10,
+                random_state=random_state,
+            )
+            trained_any = True
+        # 주말 모델
+        if hasattr(st.session_state, 'X_gas_train_weekend'):
+            st.session_state.gas_model_weekend = train_lgbm_gas_model(
+                st.session_state.X_gas_train_weekend,
+                st.session_state.y_gas_train_weekend,
+                monotone_constraints=monotone_constraints,
+                n_estimators=300,
+                learning_rate=0.05,
+                num_leaves=63,
+                min_child_samples=10,
+                random_state=random_state,
+            )
+            trained_any = True
+
+        if not trained_any and hasattr(st.session_state, 'X_gas_train'):
+            # 단일 모델로 학습
+            st.session_state.gas_model = train_lgbm_gas_model(
+                st.session_state.X_gas_train,
+                st.session_state.y_gas_train,
+                monotone_constraints=monotone_constraints,
+                n_estimators=300,
+                learning_rate=0.05,
+                num_leaves=63,
+                min_child_samples=10,
+                random_state=random_state,
+            )
+            st.success("✅ 전력수요 및 가스수요 모델 학습 완료! (단일)")
+        else:
+            msg = "✅ 가스수요 분리 모델 학습 완료: "
+            parts = []
+            if hasattr(st.session_state, 'gas_model_weekday'):
+                parts.append("평일")
+            if hasattr(st.session_state, 'gas_model_weekend'):
+                parts.append("주말")
+            st.success(msg + ", ".join(parts))
     else:
         st.success("✅ 전력수요 모델 학습 완료!")
 
@@ -1036,13 +1180,23 @@ with st.spinner("성능을 평가 중..."):
     st.session_state.r2_min = r2_score(y_min_test, y_min_pred)
     
     # 가스수요 모델 성능 평가 (가능한 경우)
-    if hasattr(st.session_state, 'gas_model'):
+    # 분리 모델 우선 평가
+    if hasattr(st.session_state, 'gas_model_weekday') and hasattr(st.session_state, 'X_gas_test_weekday'):
+        y_pred_wd = st.session_state.gas_model_weekday.predict(st.session_state.X_gas_test_weekday)
+        st.session_state.mae_gas_weekday = mean_absolute_error(st.session_state.y_gas_test_weekday, y_pred_wd)
+        st.session_state.r2_gas_weekday = r2_score(st.session_state.y_gas_test_weekday, y_pred_wd)
+    if hasattr(st.session_state, 'gas_model_weekend') and hasattr(st.session_state, 'X_gas_test_weekend'):
+        y_pred_we = st.session_state.gas_model_weekend.predict(st.session_state.X_gas_test_weekend)
+        st.session_state.mae_gas_weekend = mean_absolute_error(st.session_state.y_gas_test_weekend, y_pred_we)
+        st.session_state.r2_gas_weekend = r2_score(st.session_state.y_gas_test_weekend, y_pred_we)
+    # 단일 모델 평가 (백업)
+    if hasattr(st.session_state, 'gas_model') and hasattr(st.session_state, 'X_gas_test'):
         y_gas_pred = st.session_state.gas_model.predict(st.session_state.X_gas_test)
         st.session_state.mae_gas = mean_absolute_error(st.session_state.y_gas_test, y_gas_pred)
         st.session_state.r2_gas = r2_score(st.session_state.y_gas_test, y_gas_pred)
 
 # 성능 결과 표시
-if hasattr(st.session_state, 'gas_model'):
+if hasattr(st.session_state, 'gas_model') or hasattr(st.session_state, 'gas_model_weekday') or hasattr(st.session_state, 'gas_model_weekend'):
     col1, col2, col3 = st.columns(3)
     
     with col1:
@@ -1057,8 +1211,16 @@ if hasattr(st.session_state, 'gas_model'):
     
     with col3:
         st.subheader("🔥 가스수요 예측 모델 성능")
-        st.metric("평균 절대 오차 (MAE)", f"{st.session_state.mae_gas:,.0f} MW")
-        st.metric("결정 계수 (R²)", f"{st.session_state.r2_gas:.4f}")
+        if hasattr(st.session_state, 'mae_gas_weekday') or hasattr(st.session_state, 'mae_gas_weekend'):
+            if hasattr(st.session_state, 'mae_gas_weekday'):
+                st.metric("평일 MAE", f"{st.session_state.mae_gas_weekday:,.0f} MW")
+                st.metric("평일 R²", f"{st.session_state.r2_gas_weekday:.4f}")
+            if hasattr(st.session_state, 'mae_gas_weekend'):
+                st.metric("주말 MAE", f"{st.session_state.mae_gas_weekend:,.0f} MW")
+                st.metric("주말 R²", f"{st.session_state.r2_gas_weekend:.4f}")
+        elif hasattr(st.session_state, 'mae_gas'):
+            st.metric("MAE", f"{st.session_state.mae_gas:,.0f} MW")
+            st.metric("R²", f"{st.session_state.r2_gas:.4f}")
 else:
     col1, col2 = st.columns(2)
     
@@ -1090,6 +1252,8 @@ with col1:
     
     # 평균기온 입력
     avg_temp = st.number_input("평균기온 (°C)", min_value=-50.0, max_value=50.0, value=20.0, step=0.1)
+    # 체감온도 입력 (여름/겨울 적용)
+    feels_like_simple = st.number_input("체감온도 (°C)", min_value=-50.0, max_value=50.0, value=20.0, step=0.1)
     
     # 월 선택 (계절성 고려)
     month_options = list(range(1, 13))
@@ -1102,6 +1266,7 @@ with col2:
     st.subheader("📊 입력 정보")
     st.write(f"**선택된 요일:** {selected_weekday}")
     st.write(f"**평균기온:** {avg_temp}°C")
+    st.write(f"**체감온도:** {feels_like_simple}°C")
     st.write(f"**선택된 월:** {selected_month}월")
 
 # 예측 실행
@@ -1122,18 +1287,24 @@ if predict_button:
             # 평일 원핫 인코딩
             weekday_dummies['평일_평일'] = is_weekday
             
-            # 최대수요 예측을 위한 특징 생성
+            # 계절 판별
+            is_summer_sel = selected_month in [5, 6, 7, 8, 9]
+            is_winter_sel = selected_month in [10, 11, 12, 1, 2, 3, 4]
+
+            # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 추정 최고기온)
+            est_high = avg_temp + 5
             max_features = {
-                '최고기온': avg_temp + 5,  # 평균기온 + 5도로 추정
+                '온도특징_최대': feels_like_simple if is_summer_sel else est_high,
                 '평균기온': avg_temp,
                 '월': selected_month,
                 '어제의_최대수요': 50000  # 기본값 (실제로는 이전 데이터 필요)
             }
             max_features.update(weekday_dummies)
             
-            # 최저수요 예측을 위한 특징 생성
+            # 최저수요 예측을 위한 특징 생성 (겨울: 체감온도, 그 외: 추정 최저기온)
+            est_low = avg_temp - 5
             min_features = {
-                '최저기온': avg_temp - 5,  # 평균기온 - 5도로 추정
+                '온도특징_최저': feels_like_simple if is_winter_sel else est_low,
                 '평균기온': avg_temp,
                 '월': selected_month,
                 '어제의_최저수요': 30000  # 기본값 (실제로는 이전 데이터 필요)
@@ -1212,7 +1383,7 @@ if predict_button:
 # --- 새로운 예측 기능: 최저기온/최고기온 입력 ---
 st.markdown("---")
 st.subheader("🌡️ 상세 기온 기반 예측")
-st.info("최저기온과 최고기온을 직접 입력하여 더 정확한 예측을 수행합니다.")
+st.info("최저기온, 최고기온, 체감온도를 직접 입력하여 더 정확한 예측을 수행합니다.")
 
 # 새로운 예측 입력 폼
 col1, col2 = st.columns(2)
@@ -1229,6 +1400,9 @@ with col1:
     # 최고기온 입력
     max_temp = st.number_input("최고기온 (°C)", min_value=-50.0, max_value=50.0, value=25.0, step=0.1, key="max_temp")
     
+    # 체감온도 입력
+    feels_like_detailed = st.number_input("체감온도 (°C)", min_value=-50.0, max_value=50.0, value=(min_temp + max_temp) / 2, step=0.1, key="feels_like_detailed")
+
     # 월 선택 (계절성 고려)
     selected_month_detailed = st.selectbox("월 선택", month_options, index=4, key="month_detailed")  # 5월 기본값
     
@@ -1240,6 +1414,7 @@ with col2:
     st.write(f"**선택된 요일:** {selected_weekday_detailed}")
     st.write(f"**최저기온:** {min_temp}°C")
     st.write(f"**최고기온:** {max_temp}°C")
+    st.write(f"**체감온도:** {feels_like_detailed}°C")
     st.write(f"**평균기온:** {(min_temp + max_temp) / 2:.1f}°C")
     st.write(f"**선택된 월:** {selected_month_detailed}월")
 
@@ -1264,18 +1439,22 @@ if predict_detailed_button:
             # 평일 원핫 인코딩
             weekday_dummies_detailed['평일_평일'] = is_weekday_detailed
             
-            # 최대수요 예측을 위한 특징 생성 (실제 최고기온 사용)
+            # 계절 판별
+            is_summer_detailed = selected_month_detailed in [5, 6, 7, 8, 9]
+            is_winter_detailed = selected_month_detailed in [10, 11, 12, 1, 2, 3, 4]
+
+            # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 실제 최고기온)
             max_features_detailed = {
-                '최고기온': max_temp,  # 실제 최고기온 사용
+                '온도특징_최대': feels_like_detailed if is_summer_detailed else max_temp,
                 '평균기온': avg_temp_detailed,
                 '월': selected_month_detailed,
                 '어제의_최대수요': 50000  # 기본값
             }
             max_features_detailed.update(weekday_dummies_detailed)
             
-            # 최저수요 예측을 위한 특징 생성 (실제 최저기온 사용)
+            # 최저수요 예측을 위한 특징 생성 (겨울: 체감온도, 그 외: 실제 최저기온)
             min_features_detailed = {
-                '최저기온': min_temp,  # 실제 최저기온 사용
+                '온도특징_최저': feels_like_detailed if is_winter_detailed else min_temp,
                 '평균기온': avg_temp_detailed,
                 '월': selected_month_detailed,
                 '어제의_최저수요': 30000  # 기본값
@@ -1308,8 +1487,8 @@ if predict_detailed_button:
             # 예측 결과 상세 정보
             st.subheader("📋 상세 예측 상세 정보")
             prediction_info_detailed = pd.DataFrame({
-                '항목': ['요일', '최저기온', '최고기온', '평균기온', '월', '예측 최대수요', '예측 최저수요', '수요 차이'],
-                '값': [selected_weekday_detailed, f"{min_temp}°C", f"{max_temp}°C", f"{avg_temp_detailed:.1f}°C", f"{selected_month_detailed}월", 
+                '항목': ['요일', '최저기온', '최고기온', '체감온도', '평균기온', '월', '예측 최대수요', '예측 최저수요', '수요 차이'],
+                '값': [selected_weekday_detailed, f"{min_temp}°C", f"{max_temp}°C", f"{feels_like_detailed:.1f}°C", f"{avg_temp_detailed:.1f}°C", f"{selected_month_detailed}월", 
                       f"{predicted_max_detailed:,.0f} MW", f"{predicted_min_detailed:,.0f} MW", 
                       f"{predicted_max_detailed - predicted_min_detailed:,.0f} MW"]
             })
@@ -1359,12 +1538,16 @@ st.subheader("🔥 가스수요 예측")
 st.info("최대수요와 태양광최대를 기반으로 가스수요를 예측합니다.")
 
 # 가스수요 예측 (가능한 경우)
-if hasattr(st.session_state, 'gas_model'):
+if hasattr(st.session_state, 'gas_model') or hasattr(st.session_state, 'gas_model_weekday') or hasattr(st.session_state, 'gas_model_weekend'):
     col1, col2 = st.columns(2)
     
     with col1:
         st.subheader("📝 가스수요 예측 조건 입력")
         
+        # 요일 선택 (평일/주말 반영)
+        gas_weekday = st.selectbox("요일 선택", ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일'], index=0, key="gas_weekday")
+        gas_is_weekday = 1 if gas_weekday in ['월요일', '화요일', '수요일', '목요일', '금요일'] else 0
+
         # 최대수요 입력
         max_demand_input = st.number_input(
             "최대수요 (MW)",
@@ -1388,6 +1571,7 @@ if hasattr(st.session_state, 'gas_model'):
     
     with col2:
         st.subheader("📊 가스수요 입력 정보")
+        st.write(f"**요일:** {gas_weekday} ({'평일' if gas_is_weekday else '주말'})")
         st.write(f"**최대수요:** {max_demand_input:,.0f} MW")
         st.write(f"**태양광최대:** {solar_max_input:,.0f} MW")
     
@@ -1405,24 +1589,49 @@ if hasattr(st.session_state, 'gas_model'):
                 else:
                     gas_rate = 0.0
 
-                # 태양광/가스 비율 (0 나눗셈 방지)
-                denom = last_gas if (last_gas is not None and last_gas != 0) else 1.0
+                # 입력 기반 파생
+                residual_load_input = max_demand_input - solar_max_input
+                denom_total = max_demand_input if max_demand_input != 0 else 1.0
+                solar_ratio_total = solar_max_input / denom_total
+                residual_ratio_total = residual_load_input / denom_total
 
-                prediction_input_gas = pd.DataFrame({
-                    '최대수요': [max_demand_input],
-                    '태양광최대': [solar_max_input],
-                    '잔여부하': [max_demand_input - solar_max_input],
-                    '어제의_가스수요': [last_gas if last_gas is not None else 0.0],
-                    '가스수요_변화율': [gas_rate],
-                    '태양광_가스_비율': [solar_max_input / denom]
+                # 안전한 가스/태양광 비율 (최근 가스가 없다면 0)
+                # 필요 없는 파생 제거: 태양광_가스_비율 사용 안 함
+
+                # 예측 입력을 학습 특징에 맞춰 구성 (누락 컬럼은 0으로 채움)
+                input_dict = {f: 0.0 for f in st.session_state.features_gas}
+                input_dict.update({
+                    '최대수요': max_demand_input,
+                    '태양광최대': solar_max_input,
+                    '잔여부하': residual_load_input,
+                    '최대수요대비_태양광비율': solar_ratio_total,
+                    '최대수요대비_잔여부하비율': residual_ratio_total,
+                    '목표가스_예산': max_demand_input * (st.session_state.get('gas_total_ratio_weekday', 0.0) if gas_is_weekday else st.session_state.get('gas_total_ratio_weekend', 0.0)) - solar_max_input,
+                    '어제의_가스수요': last_gas if last_gas is not None else 0.0,
+                    '어제의_가스수요_변화율': gas_rate,
+                    '평일_평일': float(gas_is_weekday),
                 })
+
+                prediction_input_gas = pd.DataFrame([input_dict])
                 
                 # Step 5에서 학습된 모델의 특징 변수와 동일하게 맞춤
                 if hasattr(st.session_state, 'features_gas'):
                     prediction_input_gas = prediction_input_gas[st.session_state.features_gas]
                     
-                    # 가스수요 예측
-                    predicted_gas_demand = st.session_state.gas_model.predict(prediction_input_gas)[0]
+                    # 가스수요 예측 (분리 모델 우선)
+                    used_model_name = None
+                    if gas_is_weekday and hasattr(st.session_state, 'gas_model_weekday'):
+                        predicted_gas_demand = st.session_state.gas_model_weekday.predict(prediction_input_gas)[0]
+                        used_model_name = 'weekday'
+                    elif (not gas_is_weekday) and hasattr(st.session_state, 'gas_model_weekend'):
+                        predicted_gas_demand = st.session_state.gas_model_weekend.predict(prediction_input_gas)[0]
+                        used_model_name = 'weekend'
+                    elif hasattr(st.session_state, 'gas_model'):
+                        predicted_gas_demand = st.session_state.gas_model.predict(prediction_input_gas)[0]
+                        used_model_name = 'single'
+                    else:
+                        st.error("❌ 사용 가능한 가스 모델이 없습니다.")
+                        raise RuntimeError("No gas model available")
                     # 물리적 클리핑: 0 ≤ 가스 ≤ 최대수요
                     predicted_gas_demand = max(0.0, min(predicted_gas_demand, max_demand_input))
                     
@@ -1439,8 +1648,15 @@ if hasattr(st.session_state, 'gas_model'):
                     with col3:
                         st.metric("예측 가스수요", f"{predicted_gas_demand:,.0f} MW")
                     
-                    # 예측 신뢰도
-                    confidence_gas = min(95, max(60, st.session_state.r2_gas * 100))
+                    # 예측 신뢰도 (선택 모델 기준)
+                    if used_model_name == 'weekday' and hasattr(st.session_state, 'r2_gas_weekday'):
+                        confidence_gas = min(95, max(60, st.session_state.r2_gas_weekday * 100))
+                    elif used_model_name == 'weekend' and hasattr(st.session_state, 'r2_gas_weekend'):
+                        confidence_gas = min(95, max(60, st.session_state.r2_gas_weekend * 100))
+                    elif hasattr(st.session_state, 'r2_gas'):
+                        confidence_gas = min(95, max(60, st.session_state.r2_gas * 100))
+                    else:
+                        confidence_gas = 60
                     st.metric("예측 신뢰도", f"{confidence_gas:.1f}%")
                     
                     # 예측 결과 시각화
@@ -1465,18 +1681,26 @@ if hasattr(st.session_state, 'gas_model'):
                     
                     # 예측 근거 설명
                     st.subheader("📋 예측 근거")
-                    feature_importance = st.session_state.gas_model.feature_importances_
+                    # 사용한 모델의 중요도
+                    if used_model_name == 'weekday' and hasattr(st.session_state, 'gas_model_weekday'):
+                        feature_importance = st.session_state.gas_model_weekday.feature_importances_
+                    elif used_model_name == 'weekend' and hasattr(st.session_state, 'gas_model_weekend'):
+                        feature_importance = st.session_state.gas_model_weekend.feature_importances_
+                    elif hasattr(st.session_state, 'gas_model'):
+                        feature_importance = st.session_state.gas_model.feature_importances_
+                    else:
+                        feature_importance = None
                     
                     # Step 5에서 학습된 모델의 실제 특징 변수 사용
                     if hasattr(st.session_state, 'features_gas'):
-                        importance_df = pd.DataFrame({
-                            '특성': st.session_state.features_gas,
-                            '중요도': feature_importance
-                        }).sort_values('중요도', ascending=False)
-                        
-                        st.info(f"💡 주요 영향 요인: {importance_df.iloc[0]['특성']} ({importance_df.iloc[0]['중요도']:.1%})")
-                        if len(importance_df) > 1:
-                            st.info(f"💡 보조 영향 요인: {importance_df.iloc[1]['특성']} ({importance_df.iloc[1]['중요도']:.1%})")
+                        if feature_importance is not None:
+                            importance_df = pd.DataFrame({
+                                '특성': st.session_state.features_gas,
+                                '중요도': feature_importance
+                            }).sort_values('중요도', ascending=False)
+                            st.info(f"💡 주요 영향 요인: {importance_df.iloc[0]['특성']} ({importance_df.iloc[0]['중요도']:.1%})")
+                            if len(importance_df) > 1:
+                                st.info(f"💡 보조 영향 요인: {importance_df.iloc[1]['특성']} ({importance_df.iloc[1]['중요도']:.1%})")
                     else:
                         st.info("💡 모델의 특징 중요도 정보를 확인할 수 없습니다.")
                     
