@@ -17,6 +17,7 @@ from functools import partial
 
 # 성능 관련 상수
 APPLY_SHEET_FORMATTING = False  # 구글시트 업데이트 시 서식 적용 여부 (속도 개선을 위해 기본 비활성화)
+QUICK_SHEET_CONNECT = True      # 구글시트 연결 시 검증 호출 생략하여 초기 로딩 가속
 
 # 학습 캐싱 함수들
 @st.cache_resource(show_spinner=False)
@@ -112,20 +113,21 @@ def setup_google_sheets():
                 # gspread 클라이언트 생성
                 client = gspread.authorize(creds)
                 
-                # 연결 테스트
-                try:
-                    # 간단한 테스트로 연결 확인
-                    test_sheet = client.open_by_key("1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4")
-                    return client
-                except Exception as test_error:
-                    st.error(f"❌ 구글 시트 접근 테스트 실패: {str(test_error)}")
-                    st.info("""
-                    **구글 시트 접근 권한 확인:**
-                    1. 서비스 계정 이메일: power-supply@flash-zenith-453703-p6.iam.gserviceaccount.com
-                    2. 구글 시트 ID: 1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4
-                    3. 구글 시트에 서비스 계정 이메일을 편집자로 추가했는지 확인
-                    """)
-                    return None
+                # 연결 테스트(옵션)
+                if not QUICK_SHEET_CONNECT:
+                    try:
+                        test_sheet = client.open_by_key("1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4")
+                        return client
+                    except Exception as test_error:
+                        st.error(f"❌ 구글 시트 접근 테스트 실패: {str(test_error)}")
+                        st.info("""
+                        **구글 시트 접근 권한 확인:**
+                        1. 서비스 계정 이메일: power-supply@flash-zenith-453703-p6.iam.gserviceaccount.com
+                        2. 구글 시트 ID: 1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4
+                        3. 구글 시트에 서비스 계정 이메일을 편집자로 추가했는지 확인
+                        """)
+                        return None
+                return client
             else:
                 st.warning("⚠️ Streamlit secrets에서 GOOGLE_CREDENTIALS_JSON을 찾을 수 없습니다.")
         except Exception as e:
@@ -163,23 +165,23 @@ def setup_google_sheets():
                 # gspread 클라이언트 생성
                 client = gspread.authorize(creds)
                 
-                # 연결 테스트
-                try:
-                    # 간단한 테스트로 연결 확인
-                    test_sheet = client.open_by_key("1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4")
-                    return client
-                except Exception as test_error:
-                    st.error(f"❌ 구글 시트 접근 테스트 실패: {str(test_error)}")
-                    st.info("""
-                    **구글 시트 접근 권한 확인:**
-                    1. 서비스 계정 이메일: 새로운_서비스_계정_이메일@test-92f50.iam.gserviceaccount.com
-                    2. 구글 시트 ID: 1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4
-                    3. 구글 시트에 서비스 계정 이메일을 편집자로 추가했는지 확인
-                    """)
-                    return None
-                except Exception as e:
-                    st.error(f"❌ 새로운 키 파일 인증 오류: {str(e)}")
-                    return None
+                if not QUICK_SHEET_CONNECT:
+                    try:
+                        test_sheet = client.open_by_key("1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4")
+                        return client
+                    except Exception as test_error:
+                        st.error(f"❌ 구글 시트 접근 테스트 실패: {str(test_error)}")
+                        st.info("""
+                        **구글 시트 접근 권한 확인:**
+                        1. 서비스 계정 이메일: 새로운_서비스_계정_이메일@test-92f50.iam.gserviceaccount.com
+                        2. 구글 시트 ID: 1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4
+                        3. 구글 시트에 서비스 계정 이메일을 편집자로 추가했는지 확인
+                        """)
+                        return None
+                return client
+            except Exception as e:
+                st.error(f"❌ 새로운 키 파일 인증 오류: {str(e)}")
+                return None
             except Exception as e:
                 st.error(f"❌ 새로운 키 파일 읽기 오류: {str(e)}")
                 return None
@@ -215,20 +217,20 @@ def setup_google_sheets():
                 # gspread 클라이언트 생성
                 client = gspread.authorize(creds)
                 
-                # 연결 테스트
-                try:
-                    # 간단한 테스트로 연결 확인
-                    test_sheet = client.open_by_key("1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4")
-                    return client
-                except Exception as test_error:
-                    st.error(f"❌ 구글 시트 접근 테스트 실패: {str(test_error)}")
-                    st.info("""
-                    **구글 시트 접근 권한 확인:**
-                    1. 서비스 계정 이메일: firebase-adminsdk-fbsvc@test-92f50.iam.gserviceaccount.com
-                    2. 구글 시트 ID: 1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4
-                    3. 서비스 계정이 구글 시트에 편집자 권한으로 공유되어 있는지 확인
-                    """)
-                    return None
+                if not QUICK_SHEET_CONNECT:
+                    try:
+                        test_sheet = client.open_by_key("1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4")
+                        return client
+                    except Exception as test_error:
+                        st.error(f"❌ 구글 시트 접근 테스트 실패: {str(test_error)}")
+                        st.info("""
+                        **구글 시트 접근 권한 확인:**
+                        1. 서비스 계정 이메일: firebase-adminsdk-fbsvc@test-92f50.iam.gserviceaccount.com
+                        2. 구글 시트 ID: 1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4
+                        3. 서비스 계정이 구글 시트에 편집자 권한으로 공유되어 있는지 확인
+                        """)
+                        return None
+                return client
                     
             except json.JSONDecodeError as e:
                 st.error(f"❌ JSON 파싱 오류: {str(e)}")
@@ -1198,8 +1200,6 @@ with col1:
     weekday_options = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
     selected_weekday = st.selectbox("요일 선택", weekday_options, index=0)
     
-    # 평균기온 입력
-    avg_temp = st.number_input("평균기온 (°C)", min_value=-50.0, max_value=50.0, value=20.0, step=0.1)
     # 체감온도 입력 (여름/겨울 적용)
     feels_like_simple = st.number_input("체감온도 (°C)", min_value=-50.0, max_value=50.0, value=20.0, step=0.1)
     
@@ -1213,7 +1213,6 @@ with col1:
 with col2:
     st.subheader("📊 입력 정보")
     st.write(f"**선택된 요일:** {selected_weekday}")
-    st.write(f"**평균기온:** {avg_temp}°C")
     st.write(f"**체감온도:** {feels_like_simple}°C")
     st.write(f"**선택된 월:** {selected_month}월")
 
@@ -1239,21 +1238,19 @@ if predict_button:
             is_summer_sel = selected_month in [5, 6, 7, 8, 9]
             is_winter_sel = selected_month in [10, 11, 12, 1, 2, 3, 4]
 
-            # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 추정 최고기온)
-            est_high = avg_temp + 5
+            # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 체감온도 대용)
+            est_high = feels_like_simple
             max_features = {
                 '온도특징_최대': feels_like_simple if is_summer_sel else est_high,
-                '평균기온': avg_temp,
                 '월': selected_month,
                 '어제의_최대수요': 50000  # 기본값 (실제로는 이전 데이터 필요)
             }
             max_features.update(weekday_dummies)
             
-            # 최저수요 예측을 위한 특징 생성 (겨울: 체감온도, 그 외: 추정 최저기온)
-            est_low = avg_temp - 5
+            # 최저수요 예측을 위한 특징 생성 (겨울: 체감온도, 그 외: 체감온도 대용)
+            est_low = feels_like_simple
             min_features = {
                 '온도특징_최저': feels_like_simple if is_winter_sel else est_low,
-                '평균기온': avg_temp,
                 '월': selected_month,
                 '어제의_최저수요': 30000  # 기본값 (실제로는 이전 데이터 필요)
             }
@@ -1285,8 +1282,8 @@ if predict_button:
             # 예측 결과 상세 정보
             st.subheader("📋 예측 상세 정보")
             prediction_info = pd.DataFrame({
-                '항목': ['요일', '평균기온', '월', '예측 최대수요', '예측 최저수요', '수요 차이'],
-                '값': [selected_weekday, f"{avg_temp}°C", f"{selected_month}월", 
+                '항목': ['요일', '체감온도', '월', '예측 최대수요', '예측 최저수요', '수요 차이'],
+                '값': [selected_weekday, f"{feels_like_simple}°C", f"{selected_month}월", 
                       f"{predicted_max:,.0f} MW", f"{predicted_min:,.0f} MW", 
                       f"{predicted_max - predicted_min:,.0f} MW"]
             })
@@ -1317,7 +1314,7 @@ if predict_button:
             ))
             
             fig_prediction.update_layout(
-                title=f"{selected_weekday} ({avg_temp}°C) 전력 수요 예측",
+                title=f"{selected_weekday} (체감 {feels_like_simple}°C) 전력 수요 예측",
                 yaxis_title="전력 수요 (MW)",
                 showlegend=True
             )
