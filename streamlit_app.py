@@ -12,6 +12,41 @@ import gspread
 from google.oauth2.service_account import Credentials
 import os
 import json
+from functools import partial
+
+# 성능 관련 상수
+APPLY_SHEET_FORMATTING = False  # 구글시트 업데이트 시 서식 적용 여부 (속도 개선을 위해 기본 비활성화)
+
+# 학습 캐싱 함수들
+@st.cache_resource(show_spinner=False)
+def train_rf_model(X: pd.DataFrame, y: pd.Series, *, n_estimators: int, random_state: int) -> RandomForestRegressor:
+    model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
+    model.fit(X, y)
+    return model
+
+@st.cache_resource(show_spinner=False)
+def train_lgbm_gas_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    monotone_constraints: list,
+    n_estimators: int,
+    learning_rate: float,
+    num_leaves: int,
+    min_child_samples: int,
+    random_state: int
+):
+    model = LGBMRegressor(
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        num_leaves=num_leaves,
+        min_child_samples=min_child_samples,
+        random_state=random_state,
+        n_jobs=-1,
+        monotone_constraints=monotone_constraints,
+    )
+    model.fit(X, y)
+    return model
 
 # 페이지 설정 (반드시 첫 번째 Streamlit 명령어여야 함)
 st.set_page_config(
@@ -456,24 +491,20 @@ def save_data_to_sheet(client, data, sheet_name="power_data", sheet_id=None, ori
                     
                     # 서식 복사: 바로 위 행의 서식을 따라가도록 설정
                     try:
-                        # 위 행의 서식 정보 가져오기
-                        if start_row > 2:  # 첫 번째 행이 아닌 경우
-                            # 기본 서식 설정 (위 행과 동일한 스타일)
+                        if APPLY_SHEET_FORMATTING and start_row > 2:  # 옵션: 서식 적용
                             format_range = f'A{start_row}:{chr(65 + len(group_values[0]) - 1)}{end_row}'
-                            
-                            # 기본 서식 적용 (11pt Arial 폰트만)
                             sheet.format(format_range, {
                                 "textFormat": {
                                     "fontSize": 11,
                                     "fontFamily": "Arial"
                                 }
                             })
-                            st.info(f"✅ 서식 적용 완료: {format_range}")
                     except Exception as e:
                         st.warning(f"⚠️ 서식 적용 실패: {str(e)}")
                     
                     # 데이터 업데이트
-                    sheet.update(range_name, group_values)
+                    # 빠른 업데이트(배치) 모드
+                    sheet.update(range_name, group_values, value_input_option='RAW')
                 
                 return True, f"✅ {len(changed_rows)}개 행이 {len(row_groups)}개 그룹으로 업데이트되었습니다."
         
@@ -502,7 +533,7 @@ def save_data_to_sheet(client, data, sheet_name="power_data", sheet_id=None, ori
         
         # 시트를 한 번에 업데이트
         sheet.clear()
-        sheet.update('A1', all_values)
+        sheet.update('A1', all_values, value_input_option='RAW')
         
         return True, "✅ 전체 데이터가 업데이트되었습니다."
         
@@ -956,11 +987,9 @@ st.markdown("---")
 # --- 4. 모델 학습 ---
 st.header("🤖 Step 4: 모델 학습")
 with st.spinner("모델을 학습 중..."):
-    rf_max = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
-    rf_max.fit(X_max_train, y_max_train)
+    rf_max = train_rf_model(X_max_train, y_max_train, n_estimators=n_estimators, random_state=random_state)
     
-    rf_min = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
-    rf_min.fit(X_min_train, y_min_train)
+    rf_min = train_rf_model(X_min_train, y_min_train, n_estimators=n_estimators, random_state=random_state)
     
     # 가스수요 모델 학습 (가능한 경우) - LightGBM + 단조 제약
     if hasattr(st.session_state, 'X_gas_train'):
@@ -977,17 +1006,17 @@ with st.spinner("모델을 학습 중..."):
         }
         monotone_constraints = [constraint_map.get(f, 0) for f in features_for_constraints]
 
-        lgb_gas = LGBMRegressor(
+        # 캐시된 학습 사용
+        st.session_state.gas_model = train_lgbm_gas_model(
+            st.session_state.X_gas_train,
+            st.session_state.y_gas_train,
+            monotone_constraints=monotone_constraints,
             n_estimators=300,
             learning_rate=0.05,
             num_leaves=63,
             min_child_samples=10,
             random_state=random_state,
-            n_jobs=-1,
-            monotone_constraints=monotone_constraints
         )
-        lgb_gas.fit(st.session_state.X_gas_train, st.session_state.y_gas_train)
-        st.session_state.gas_model = lgb_gas
         st.success("✅ 전력수요 및 가스수요 모델 학습 완료! (LightGBM + 단조 제약)")
     else:
         st.success("✅ 전력수요 모델 학습 완료!")
