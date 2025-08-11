@@ -37,6 +37,7 @@ def train_lgbm_gas_model(
     min_child_samples: int,
     random_state: int
 ):
+    # 중요한 하이퍼파라미터만 캐시 키에 반영하도록 인자 유지
     model = LGBMRegressor(
         n_estimators=n_estimators,
         learning_rate=learning_rate,
@@ -71,6 +72,7 @@ if 'r2_min' not in st.session_state:
     st.session_state.r2_min = None
 
 # 구글 시트 설정
+@st.cache_resource(show_spinner=False)
 def setup_google_sheets():
     """구글 시트 연결 설정"""
     try:
@@ -358,7 +360,7 @@ def setup_google_sheets():
         return None
 
 def load_data_from_sheet(client, sheet_name="power_data", sheet_id=None):
-    """구글 시트에서 데이터 로드"""
+    """구글 시트에서 데이터 로드 (비캐시 원본)"""
     try:
         # 시트 열기 (ID가 제공된 경우 ID로, 아니면 이름으로)
         if sheet_id and sheet_id.strip():
@@ -398,6 +400,14 @@ def load_data_from_sheet(client, sheet_name="power_data", sheet_id=None):
     except Exception as e:
         st.error(f"❌ 시트 데이터 로드 오류: {str(e)}")
         return None
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_data_from_sheet_cached(sheet_name="power_data", sheet_id=None):
+    """구글 시트에서 데이터 로드 (캐시) - 5분 TTL"""
+    client = setup_google_sheets()
+    if client is None:
+        return None
+    return load_data_from_sheet(client, sheet_name, sheet_id)
 
 def save_data_to_sheet(client, data, sheet_name="power_data", sheet_id=None, original_data=None):
     """구글 시트에 데이터 저장 (변경된 부분만 업데이트)"""
@@ -566,32 +576,22 @@ st.header("📁 Step 0: 데이터 로딩 및 편집")
 # 구글 시트 설정
 st.subheader("🔐 구글 시트 연결 설정")
 
-# 구글 시트 클라이언트 설정
 client = setup_google_sheets()
-
 if client is None:
-    st.error("❌ 구글 시트 연결에 실패했습니다.")
-    st.info("""
-    **구글 시트 설정 확인:**
-    1. 구글 시트 ID: `1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4`에 접근 가능한지 확인
-    2. 서비스 계정 이메일: `firebase-adminsdk-fbsvc@test-92f50.iam.gserviceaccount.com`이 편집자 권한으로 공유되어 있는지 확인
-    """)
-    st.stop()
-else:
-    st.success("✅ 구글 시트 연결 성공!")
+    st.warning("⚠️ 구글 시트 연결이 일시적으로 지연됩니다. 캐시된 데이터를 불러옵니다.")
 
 # 구글 시트 설정 정보
 sheet_name = "시트1"
 sheet_id = "1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4"
 
-# 데이터 자동 로딩
+# 데이터 자동 로딩 (캐시 우선)
 if 'data' not in st.session_state:
-    with st.spinner("구글 시트에서 데이터를 로딩 중..."):
-        data = load_data_from_sheet(client, sheet_name, sheet_id)
-        
+    with st.spinner("데이터 로딩 중..."):
+        data = load_data_from_sheet_cached(sheet_name, sheet_id)
+        if data is None and client is not None:
+            data = load_data_from_sheet(client, sheet_name, sheet_id)
         if data is not None:
             st.session_state.data = data
-            # 원본 데이터 저장 (변경 감지를 위해)
             st.session_state.original_data = data.copy()
         else:
             st.error("❌ 데이터 로딩에 실패했습니다.")
@@ -945,7 +945,10 @@ with st.spinner("특징 공학을 수행 중..."):
     else:
         st.success("✅ 전력수요 데이터 정제 완료!")
     
-    data_processed.dropna(inplace=True)
+    # 핵심 학습 피처 위주로 결측 제거 (불필요한 전체 드랍 방지)
+    essential_cols = ['최대수요','최저수요','태양광최대','최고기온','최저기온','평균기온','체감온도','월','어제의_최대수요','어제의_최저수요']
+    essential_cols = [c for c in essential_cols if c in data_processed.columns]
+    data_processed.dropna(subset=essential_cols, inplace=True)
     
     # 처리된 데이터 정보
     col1, col2 = st.columns(2)
