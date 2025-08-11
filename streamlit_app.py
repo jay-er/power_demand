@@ -822,14 +822,22 @@ with st.spinner("데이터를 전처리 중..."):
         st.error("❌ '날짜' 컬럼이 없습니다. 데이터를 확인해주세요.")
         st.stop()
     
-    # 필수 컬럼 확인
+    # 필수 컬럼 확인 (유연하게 처리)
     required_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '최저수요', '요일', '평일', '체감온도']
     missing_columns = [col for col in required_columns if col not in data.columns]
     
     if missing_columns:
-        st.error(f"❌ 필수 컬럼이 누락되었습니다: {missing_columns}")
-        st.info("필수 컬럼: 날짜, 최고기온, 평균기온, 최저기온, 최대수요, 최저수요, 요일, 평일, 체감온도")
-        st.stop()
+        st.warning(f"⚠️ 일부 컬럼이 누락되었습니다: {missing_columns}")
+        st.info("누락된 컬럼이 있어도 가능한 기능만 제공됩니다.")
+        
+        # 최소한의 필수 컬럼만 확인
+        essential_columns = ['날짜', '최대수요', '최저수요']
+        essential_missing = [col for col in essential_columns if col not in data.columns]
+        
+        if essential_missing:
+            st.error(f"❌ 핵심 컬럼이 누락되었습니다: {essential_missing}")
+            st.info("최소한 날짜, 최대수요, 최저수요 컬럼은 필요합니다.")
+            st.stop()
     
     # 가스수요 데이터 확인
     gas_columns = ['가스수요', '태양광최대']
@@ -859,19 +867,48 @@ st.markdown("---")
 st.header("🔧 Step 2: 특징 공학 및 데이터 정제")
 with st.spinner("특징 공학을 수행 중..."):
     data['월'] = data['날짜'].dt.month
-    data_processed = pd.get_dummies(data, columns=['요일', '평일'], drop_first=True)
+    # 요일과 평일 컬럼이 있으면 원핫 인코딩, 없으면 기본값 생성
+    if '요일' in data.columns:
+        data_processed = pd.get_dummies(data, columns=['요일'], drop_first=True)
+    else:
+        st.warning("⚠️ '요일' 컬럼이 없어 기본 요일 특징을 생성합니다.")
+        # 기본 요일 특징 생성 (월요일 기준)
+        data_processed['요일_월요일'] = 1
+        data_processed['요일_화요일'] = 0
+        data_processed['요일_수요일'] = 0
+        data_processed['요일_목요일'] = 0
+        data_processed['요일_금요일'] = 0
+        data_processed['요일_토요일'] = 0
+        data_processed['요일_일요일'] = 0
+    
+    if '평일' in data.columns:
+        data_processed = pd.get_dummies(data, columns=['평일'], drop_first=True)
+    else:
+        st.warning("⚠️ '평일' 컬럼이 없어 기본 평일 특징을 생성합니다.")
+        # 기본 평일 특징 생성 (평일 기준)
+        data_processed['평일_평일'] = 1
     data_processed['어제의_최대수요'] = data_processed['최대수요'].shift(1)
     data_processed['어제의_최저수요'] = data_processed['최저수요'].shift(1)
     
-    # 계절별 온도 특징 생성
+    # 계절별 온도 특징 생성 (유연하게 처리)
     try:
         is_summer_mask = data_processed['월'].isin([5, 6, 7, 8, 9])
         is_winter_mask = data_processed['월'].isin([10, 11, 12, 1, 2, 3, 4])
-        if '체감온도' not in data_processed.columns:
-            st.error("❌ '체감온도' 컬럼이 없습니다. 구글시트에 '체감온도' 열을 추가해 주세요.")
+        
+        # 체감온도가 있으면 사용, 없으면 최고기온/최저기온만 사용
+        if '체감온도' in data_processed.columns:
+            data_processed['온도특징_최대'] = np.where(is_summer_mask, data_processed['체감온도'], data_processed['최고기온'])
+            data_processed['온도특징_최저'] = np.where(is_winter_mask, data_processed['체감온도'], data_processed['최저기온'])
+            st.success("✅ 체감온도를 포함한 온도 특징 생성 완료")
+        elif '최고기온' in data_processed.columns and '최저기온' in data_processed.columns:
+            # 체감온도가 없으면 최고기온/최저기온만 사용
+            data_processed['온도특징_최대'] = data_processed['최고기온']
+            data_processed['온도특징_최저'] = data_processed['최저기온']
+            st.warning("⚠️ 체감온도가 없어 최고기온/최저기온만 사용합니다.")
+        else:
+            st.error("❌ 온도 관련 컬럼이 부족합니다. 최소한 최고기온, 최저기온이 필요합니다.")
             st.stop()
-        data_processed['온도특징_최대'] = np.where(is_summer_mask, data_processed['체감온도'], data_processed['최고기온'])
-        data_processed['온도특징_최저'] = np.where(is_winter_mask, data_processed['체감온도'], data_processed['최저기온'])
+            
     except Exception as e:
         st.error(f"❌ 온도 특징 생성 중 오류: {e}")
         st.stop()
@@ -947,10 +984,24 @@ with st.spinner("특징 공학을 수행 중..."):
     else:
         st.success("✅ 전력수요 데이터 정제 완료!")
     
-    # 핵심 학습 피처 위주로 결측 제거 (불필요한 전체 드랍 방지)
-    essential_cols = ['최대수요','최저수요','태양광최대','최고기온','최저기온','평균기온','체감온도','월','어제의_최대수요','어제의_최저수요']
-    essential_cols = [c for c in essential_cols if c in data_processed.columns]
-    data_processed.dropna(subset=essential_cols, inplace=True)
+    # 핵심 학습 피처 위주로 결측 제거 (유연하게 처리)
+    essential_cols = ['최대수요','최저수요','월','어제의_최대수요','어제의_최저수요']
+    
+    # 온도 관련 컬럼이 있으면 추가
+    if '온도특징_최대' in data_processed.columns:
+        essential_cols.append('온도특징_최대')
+    if '온도특징_최저' in data_processed.columns:
+        essential_cols.append('온도특징_최저')
+    
+    # 실제 존재하는 컬럼만 필터링
+    available_essential_cols = [c for c in essential_cols if c in data_processed.columns]
+    
+    if len(available_essential_cols) >= 3:  # 최소 3개 컬럼은 필요
+        data_processed.dropna(subset=available_essential_cols, inplace=True)
+        st.success(f"✅ {len(available_essential_cols)}개 핵심 컬럼으로 데이터 정제 완료")
+    else:
+        st.error("❌ 핵심 컬럼이 너무 적습니다. 최소한 최대수요, 최저수요, 월 컬럼이 필요합니다.")
+        st.stop()
     
     # 처리된 데이터 정보
     col1, col2 = st.columns(2)
