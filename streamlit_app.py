@@ -946,6 +946,7 @@ with st.spinner("특징 공학을 수행 중..."):
             data_processed['평일_평일'] = (data['날짜'].dt.weekday < 5).astype(int)
     except Exception:
         data_processed['평일_평일'] = 0
+    # 어제 수요 래그
     data_processed['어제의_최대수요'] = data_processed['최대수요'].shift(1)
     
     # 계절별 온도 특징 생성 (유연하게 처리)
@@ -953,17 +954,31 @@ with st.spinner("특징 공학을 수행 중..."):
         is_summer_mask = data_processed['월'].isin([5, 6, 7, 8, 9])
         is_winter_mask = data_processed['월'].isin([10, 11, 12, 1, 2, 3, 4])
         
-        # 체감온도가 있으면 사용, 없으면 최고기온/최저기온만 사용
+        # 개선된 계절별 온도 특징: 냉방강도/난방강도
+        st.subheader("🌡️ 계절별 온도 특징 최적화")
+        cooling_base_temp = 25.0
+        heating_base_temp = 10.0
+        # 냉방강도: 체감온도(있으면) 없으면 최고기온 기준으로 계산
         if '체감온도' in data_processed.columns:
-            data_processed['온도특징_최대'] = np.where(is_summer_mask, data_processed['체감온도'], data_processed['최고기온'])
-            st.success("✅ 체감온도를 포함한 온도 특징 생성 완료")
+            temp_for_cooling = data_processed['체감온도']
         elif '최고기온' in data_processed.columns:
-            # 체감온도가 없으면 최고기온만 사용
-            data_processed['온도특징_최대'] = data_processed['최고기온']
-            st.warning("⚠️ 체감온도가 없어 최고기온만 사용합니다.")
+            temp_for_cooling = data_processed['최고기온']
         else:
-            st.error("❌ 온도 관련 컬럼이 부족합니다. 최소한 최고기온이 필요합니다.")
+            st.error("❌ 온도 관련 컬럼이 부족합니다. 최소한 최고기온 또는 체감온도가 필요합니다.")
             st.stop()
+        data_processed['냉방강도'] = (pd.to_numeric(temp_for_cooling, errors='coerce') - cooling_base_temp).clip(lower=0)
+        
+        # 난방강도: 최저기온 기준으로 계산
+        if '최저기온' in data_processed.columns:
+            temp_for_heating = pd.to_numeric(data_processed['최저기온'], errors='coerce')
+            data_processed['난방강도'] = (heating_base_temp - temp_for_heating).clip(lower=0)
+        else:
+            st.warning("⚠️ 최저기온이 없어 난방강도는 0으로 대체됩니다.")
+            data_processed['난방강도'] = 0.0
+        st.success("✅ 냉방/난방 강도를 반영한 계절별 온도 특징 생성 완료!")
+        # 계절 마스크 적용: 여름엔 냉방강도만, 겨울엔 난방강도만 사용
+        data_processed['냉방강도'] = data_processed['냉방강도'] * is_summer_mask.astype(int)
+        data_processed['난방강도'] = data_processed['난방강도'] * is_winter_mask.astype(int)
 
         # 추가 온도 파생: 일교차(최고-최저) (가능할 때)
         try:
@@ -972,36 +987,24 @@ with st.spinner("특징 공학을 수행 중..."):
         except Exception:
             pass
 
-        # 시차(Lag) 및 이동평균(롤링) 특징 (누설 방지: shift 사용)
+        # 이동평균(누수 방지: shift(1) 후 rolling)
         try:
-            if '최대수요' in data_processed.columns:
-                data_processed['어제의_최대수요'] = data_processed['최대수요'].shift(1)
-                data_processed['7일평균_최대수요'] = data_processed['최대수요'].shift(1).rolling(window=7, min_periods=1).mean()
-                data_processed['14일평균_최대수요'] = data_processed['최대수요'].shift(1).rolling(window=14, min_periods=1).mean()
-                data_processed['전주동일요일_최대수요'] = data_processed['최대수요'].shift(7)
+            data_processed['7일평균_최대수요'] = data_processed['최대수요'].shift(1).rolling(window=7, min_periods=1).mean()
+            data_processed['14일평균_최대수요'] = data_processed['최대수요'].shift(1).rolling(window=14, min_periods=1).mean()
+            data_processed['전주동일요일_최대수요'] = data_processed['최대수요'].shift(7)
         except Exception:
             pass
 
         # 최신 관측 기반 동적 입력 기본값 저장 (예측 시 사용)
         try:
-            st.session_state.dynamic_max_features = {
-                '어제의_최대수요': float(data_processed['어제의_최대수요'].dropna().iloc[-1]) if '어제의_최대수요' in data_processed.columns and data_processed['어제의_최대수요'].notna().any() else 0.0,
-                '7일평균_최대수요': float(data_processed['7일평균_최대수요'].dropna().iloc[-1]) if '7일평균_최대수요' in data_processed.columns and data_processed['7일평균_최대수요'].notna().any() else 0.0,
-                '14일평균_최대수요': float(data_processed['14일평균_최대수요'].dropna().iloc[-1]) if '14일평균_최대수요' in data_processed.columns and data_processed['14일평균_최대수요'].notna().any() else 0.0,
-                '전주동일요일_최대수요': float(data_processed['전주동일요일_최대수요'].dropna().iloc[-1]) if '전주동일요일_최대수요' in data_processed.columns and data_processed['전주동일요일_최대수요'].notna().any() else 0.0,
-            }
+            st.session_state.dynamic_max_features = {}
             # 재귀 예측을 위한 최근 14일 타깃 시계열 저장
             try:
                 st.session_state.max_series_tail = list(pd.to_numeric(data_processed['최대수요'], errors='coerce').dropna().tail(14).values)
             except Exception:
                 st.session_state.max_series_tail = []
         except Exception:
-            st.session_state.dynamic_max_features = {
-                '어제의_최대수요': 0.0,
-                '7일평균_최대수요': 0.0,
-                '14일평균_최대수요': 0.0,
-                '전주동일요일_최대수요': 0.0,
-            }
+            st.session_state.dynamic_max_features = {}
             st.session_state.max_series_tail = []
             
     except Exception as e:
@@ -1104,7 +1107,7 @@ st.header("🎯 Step 3: 모델 변수 및 데이터 분리")
 include_avg_temp_feature = False
 
 # [최대수요 모델] (여름철에는 체감온도 사용)
-_base_max = ['온도특징_최대', '월', '어제의_최대수요', '7일평균_최대수요', '14일평균_최대수요', '전주동일요일_최대수요']
+_base_max = ['냉방강도', '난방강도', '월', '어제의_최대수요', '7일평균_최대수요', '14일평균_최대수요', '전주동일요일_최대수요']
 if include_avg_temp_feature:
     _base_max.insert(1, '평균기온')
 
@@ -1133,11 +1136,12 @@ X_max_train, X_max_test, y_max_train, y_max_test = chronological_split(
 # 변수 정보 표시
 st.subheader("📈 최대수요 모델 변수")
 st.write(f"특징 변수: {len(features_max)}개")
-# 표시용 이름 매핑: '온도특징_최대' → '체감온도'
-display_features_max = [
-    ('체감온도' if name == '온도특징_최대' else name)
-    for name in features_max
-]
+# 표시용 이름 매핑: '냉방강도'/'난방강도'를 직관적으로 표시
+_display_name_map = {
+    '냉방강도': '냉방강도(>25°C)',
+    '난방강도': '난방강도(<10°C)',
+}
+display_features_max = [_display_name_map.get(name, name) for name in features_max]
 # 헤더 행을 사용한 한 줄 표
 max_vars_df = pd.DataFrame([display_features_max], columns=[f'변수{i+1}' for i in range(len(display_features_max))])
 st.dataframe(max_vars_df, use_container_width=True)
@@ -1352,41 +1356,22 @@ if predict_button:
 
             # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 체감온도 대용)
             est_high = feels_like_simple
-            # 동적 입력값(최근 관측)을 세션에서 읽어와 자동 주입
-            dyn = st.session_state.get('dynamic_max_features', {})
-            max_features = {
-                '온도특징_최대': feels_like_simple if is_summer_sel else est_high,
-                '월': selected_month,
-                # 동적 입력 자동 주입 (최근 관측치)
-                '어제의_최대수요': dyn.get('어제의_최대수요', 0.0),
-                '7일평균_최대수요': dyn.get('7일평균_최대수요', 0.0),
-                '14일평균_최대수요': dyn.get('14일평균_최대수요', 0.0),
-                '전주동일요일_최대수요': dyn.get('전주동일요일_최대수요', 0.0),
-                # 추가 온도 입력(간단 모드에서는 동일 값으로 채움)
-                '최고기온': feels_like_simple,
-                '최저기온': feels_like_simple,
-                '체감온도': feels_like_simple,
-                '일교차': 0.0,
-            }
-            max_features.update(weekday_dummies)
-            
             # 모델 선택(단일 모델)
             model_max = rf_max
             
-            def predict_one_day(feels_like_val: float, month_val: int, weekday_name: str, dyn_feats: dict) -> float:
+            def predict_one_day(feels_like_val: float, month_val: int, weekday_name: str, min_temp_val=None, max_temp_val=None) -> float:
                 dummies = {'평일_평일': 1 if weekday_name in ['월요일','화요일','수요일','목요일','금요일'] else 0}
                 dummies.update({f'요일_{w}': (1 if w == weekday_name else 0) for w in ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']})
                 feats = {
-                    '온도특징_최대': feels_like_val if month_val in [5,6,7,8,9] else feels_like_val,
+                    # 냉방강도/난방강도 계산
+                    '냉방강도': max(0.0, (feels_like_val if max_temp_val is None else max_temp_val) - 25.0),
+                    '난방강도': max(0.0, 10.0 - (min_temp_val if min_temp_val is not None else feels_like_val)),
                     '월': month_val,
-                    '어제의_최대수요': dyn_feats.get('어제의_최대수요', 0.0),
-                    '7일평균_최대수요': dyn_feats.get('7일평균_최대수요', 0.0),
-                    '14일평균_최대수요': dyn_feats.get('14일평균_최대수요', 0.0),
-                    '전주동일요일_최대수요': dyn_feats.get('전주동일요일_최대수요', 0.0),
-                    '최고기온': feels_like_val,
-                    '최저기온': feels_like_val,
+                    # 계절별 추가 온도: 여름=최고기온, 겨울=최저기온
+                    '최고기온': (max_temp_val if max_temp_val is not None else feels_like_val) if month_val in [5,6,7,8,9] else 0.0,
+                    '최저기온': (min_temp_val if min_temp_val is not None else feels_like_val) if month_val in [10,11,12,1,2,3,4] else 0.0,
                     '체감온도': feels_like_val,
-                    '일교차': 0.0,
+                    '일교차': ( (max_temp_val - min_temp_val) if (max_temp_val is not None and min_temp_val is not None) else 0.0 ),
                 }
                 feats.update(dummies)
                 frame = pd.DataFrame([feats])
@@ -1396,7 +1381,7 @@ if predict_button:
 
             # 단일일 예측 또는 재귀 7일 예측
             if horizon == 1:
-                predicted_max = predict_one_day(feels_like_simple, selected_month, selected_weekday, dyn)
+                predicted_max = predict_one_day(feels_like_simple, selected_month, selected_weekday)
                 forecast_series = [predicted_max]
             else:
                 # 7일 재귀 예측: 매 스텝에서 래그/평균 업데이트
@@ -1540,15 +1525,17 @@ if predict_detailed_button:
             # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 실제 최고기온)
             dyn = st.session_state.get('dynamic_max_features', {})
             max_features_detailed = {
-                '온도특징_최대': feels_like_detailed if is_summer_detailed else max_temp,
+                # 냉방/난방 강도 사용
+                '냉방강도': max(0.0, max_temp - 25.0),
+                '난방강도': max(0.0, 10.0 - min_temp),
                 '월': selected_month_detailed,
                 '어제의_최대수요': dyn.get('어제의_최대수요', 0.0),
                 '7일평균_최대수요': dyn.get('7일평균_최대수요', 0.0),
                 '14일평균_최대수요': dyn.get('14일평균_최대수요', 0.0),
                 '전주동일요일_최대수요': dyn.get('전주동일요일_최대수요', 0.0),
-                # 세부 온도 입력 반영
-                '최고기온': max_temp,
-                '최저기온': min_temp,
+                # 계절별 추가 온도: 여름=최고기온 포함, 겨울=최저기온 포함
+                '최고기온': max_temp if is_summer_detailed else 0.0,
+                '최저기온': min_temp if is_winter_detailed else 0.0,
                 '체감온도': feels_like_detailed,
                 '일교차': max_temp - min_temp,
             }
