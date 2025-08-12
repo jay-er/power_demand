@@ -1045,69 +1045,31 @@ with st.spinner("특징 공학을 수행 중..."):
         try:
             # 7일평균 제거 요청으로 생성하지 않음
             data_processed['전주동일요일_최대수요'] = data_processed['최대수요'].shift(7)
-            # 작년 동일일 최대수요: 날짜-1년 기준 매핑(윤년 보정: 366→364일 대체 시도)
+            # 작년 동일월의 같은 요일 평균만 사용하여 작년동일일_최대수요 생성
             try:
-                last_year_map = data_processed.set_index('날짜')['최대수요']
-                ref_dates = data_processed['날짜'] - pd.DateOffset(years=1)
-                ly_values = last_year_map.reindex(ref_dates).values
-                data_processed['작년동일일_최대수요'] = ly_values
-                mask_na = pd.isna(data_processed['작년동일일_최대수요'])
-                if mask_na.any():
-                    # 366일 전 시도
-                    ly_366 = (data_processed.loc[mask_na, '날짜'] - pd.Timedelta(days=366))
-                    fill_366 = last_year_map.reindex(ly_366).values
-                    data_processed.loc[mask_na, '작년동일일_최대수요'] = fill_366
-                    mask_na = pd.isna(data_processed['작년동일일_최대수요'])
-                if mask_na.any():
-                    # 364일 전 시도
-                    ly_364 = (data_processed.loc[mask_na, '날짜'] - pd.Timedelta(days=364))
-                    fill_364 = last_year_map.reindex(ly_364).values
-                    data_processed.loc[mask_na, '작년동일일_최대수요'] = fill_364
-                    mask_na = pd.isna(data_processed['작년동일일_최대수요'])
+                # 먼저 (전년도) 월×요일 평균 맵을 준비했다고 가정하고, 없으면 지금 생성
+                ly_map = st.session_state.get('last_year_month_weekday_mean_max')
+                if not ly_map:
+                    if '연도' in data_processed.columns and '월' in data_processed.columns and '요일' in data_processed.columns:
+                        max_year = int(pd.to_numeric(data_processed['연도'], errors='coerce').dropna().max())
+                        target_year = max_year - 1
+                        df_prev_year = data_processed[pd.to_numeric(data_processed['연도'], errors='coerce') == target_year]
+                        if len(df_prev_year) == 0:
+                            df_prev_year = data_processed
+                        grp = df_prev_year.groupby(['월', '요일'])['최대수요'].mean().reset_index()
+                        ly_map = {(int(r['월']), str(r['요일'])): float(r['최대수요']) for _, r in grp.iterrows()}
+                        st.session_state.last_year_month_weekday_mean_max = ly_map
+                    else:
+                        ly_map = {}
 
-                # 계절 내 인접 월 백업(여름:5~9, 겨울:10~4) - 작년 월×요일 평균 활용
-                if mask_na.any():
-                    try:
-                        ly_map = st.session_state.get('last_year_month_weekday_mean_max', {})
-                        if ly_map and '월' in data_processed.columns and '요일' in data_processed.columns:
-                            summer_order = [5, 6, 7, 8, 9]
-                            winter_order = [10, 11, 12, 1, 2, 3, 4]
-                            summer_index = {m: i for i, m in enumerate(summer_order)}
-                            winter_index = {m: i for i, m in enumerate(winter_order)}
-
-                            missing_idx = list(data_processed.index[mask_na])
-                            for i in missing_idx:
-                                try:
-                                    month_val = int(pd.to_numeric(data_processed.at[i, '월'], errors='coerce'))
-                                    weekday_val = str(data_processed.at[i, '요일'])
-                                except Exception:
-                                    continue
-
-                                if month_val in summer_index:
-                                    season = summer_order
-                                    idx_map = summer_index
-                                else:
-                                    season = winter_order
-                                    idx_map = winter_index
-
-                                # 후보 달: 같은 시즌 내 (월, 요일) 평균 존재하는 달
-                                candidate_months = [m for m in season if (m, weekday_val) in ly_map]
-                                if not candidate_months:
-                                    continue
-
-                                target_idx = idx_map.get(month_val)
-                                if target_idx is None:
-                                    continue
-
-                                # 인접한 달 선택 (시즌 순서에서 인덱스 차 최소)
-                                chosen_month = min(candidate_months, key=lambda m: abs(idx_map[m] - target_idx))
-                                fallback_val = ly_map.get((chosen_month, weekday_val))
-                                if fallback_val is not None:
-                                    data_processed.at[i, '작년동일일_최대수요'] = float(fallback_val)
-                    except Exception:
-                        pass
+                if ly_map and '월' in data_processed.columns and '요일' in data_processed.columns:
+                    data_processed['작년동일일_최대수요'] = [
+                        float(ly_map.get((int(m), str(w)), 0.0)) for m, w in zip(data_processed['월'], data_processed['요일'])
+                    ]
+                else:
+                    data_processed['작년동일일_최대수요'] = 0.0
             except Exception:
-                pass
+                data_processed['작년동일일_최대수요'] = 0.0
             # 작년 월-요일 평균 맵(예측 시 사용할 백업)
             try:
                 # 가장 최근 연도의 직전 연도 기준으로 평균 생성
@@ -1339,9 +1301,19 @@ if '가스수요' in data_processed.columns and '태양광최대' in data_proces
         X_gas = data_processed[available_gas_features]
         y_gas = data_processed['가스수요']
         
-        # 가스수요 데이터 분할 - 시간순 분할
+        # 가스수요 데이터 분할 - 시간순 분할 (태양광최대는 2024-12-01 이후 데이터만 학습 사용)
+        try:
+            gas_date_series = pd.to_datetime(data_processed.loc[X_gas.index, '날짜'], errors='coerce')
+            cutoff = pd.Timestamp('2024-12-01')
+            mask_after_cutoff = gas_date_series >= cutoff
+            X_gas = X_gas[mask_after_cutoff]
+            y_gas = y_gas[mask_after_cutoff]
+            gas_date_series = gas_date_series[mask_after_cutoff]
+        except Exception:
+            pass
+
         X_gas_train, X_gas_test, y_gas_train, y_gas_test = chronological_split(
-            X_gas, y_gas, data_processed.loc[X_gas.index, '날짜'], test_size=test_size
+            X_gas, y_gas, gas_date_series if 'gas_date_series' in locals() else data_processed.loc[X_gas.index, '날짜'], test_size=test_size
         )
         
         st.write(f"특징 변수: {len(available_gas_features)}개")
@@ -1370,6 +1342,17 @@ if '가스수요' in data_processed.columns and '태양광최대' in data_proces
             y_gas_wd = y_gas[mask_weekday]
             X_gas_we = X_gas[~mask_weekday]
             y_gas_we = y_gas[~mask_weekday]
+
+            # 평일/주말 분리 세트에도 동일 컷오프 적용
+            try:
+                gas_dates_all = pd.to_datetime(data_processed.loc[X_gas.index, '날짜'], errors='coerce')
+                cutoff = pd.Timestamp('2024-12-01')
+                mask_after = gas_dates_all >= cutoff
+                # 재적용
+                X_gas_wd, y_gas_wd = X_gas_wd[mask_after.loc[X_gas_wd.index]], y_gas_wd[mask_after.loc[X_gas_wd.index]]
+                X_gas_we, y_gas_we = X_gas_we[mask_after.loc[X_gas_we.index]], y_gas_we[mask_after.loc[X_gas_we.index]]
+            except Exception:
+                pass
 
             # 최소 표본 확인 후 분할
             if len(X_gas_wd) >= 20 and len(X_gas_we) >= 20:
@@ -1886,30 +1869,9 @@ if submit_date_forecast:
 
             # 작년 동일일
             try:
-                ly_val = 0.0
-                if '작년동일일_최대수요' in dfp.columns:
-                    row_today_dfp = dfp[dfp['날짜'].dt.date == target_ts.date()]
-                    if not row_today_dfp.empty:
-                        ly_val = float(pd.to_numeric(row_today_dfp['작년동일일_최대수요'], errors='coerce').fillna(0).iloc[0])
-                    else:
-                        # ad-hoc 매핑 시도
-                        last_year_map = dfp.set_index('날짜')['최대수요']
-                        for dd in [365, 366, 364]:
-                            cand = last_year_map.reindex([target_ts - pd.Timedelta(days=dd)]).dropna()
-                            if len(cand) > 0:
-                                ly_val = float(cand.iloc[0])
-                                break
-                        if ly_val == 0.0:
-                            ly_map = st.session_state.get('last_year_month_weekday_mean_max', {})
-                            wd_name = weekday_name
-                            season = [5,6,7,8,9] if is_summer else [10,11,12,1,2,3,4]
-                            idx_map = {m:i for i,m in enumerate(season)}
-                            candidate_months = [m for m in season if (m, wd_name) in ly_map]
-                            if candidate_months:
-                                chosen_month = min(candidate_months, key=lambda m: abs(idx_map[m] - idx_map.get(month_val, 0)))
-                                ly_val = float(ly_map.get((chosen_month, wd_name), 0.0))
-                else:
-                    ly_val = 0.0
+                ly_map = st.session_state.get('last_year_month_weekday_mean_max', {})
+                wd_name = weekday_name
+                ly_val = float(ly_map.get((month_val, wd_name), 0.0)) if ly_map else 0.0
             except Exception:
                 ly_val = 0.0
 
