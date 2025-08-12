@@ -907,13 +907,23 @@ with st.spinner("데이터를 전처리 중..."):
         st.error("❌ '날짜' 컬럼이 없습니다. 데이터를 확인해주세요.")
         st.stop()
     
-    # 요일/평일 파생 (없으면 생성)
+    # 요일/평일/공휴일/업무일 파생 (없으면 생성)
     try:
         weekday_map = {0: '월요일', 1: '화요일', 2: '수요일', 3: '목요일', 4: '금요일', 5: '토요일', 6: '일요일'}
         if '요일' not in data.columns:
             data['요일'] = data['날짜'].dt.weekday.map(weekday_map)
+        # 공휴일 플래그 생성 (KR)
+        try:
+            kr_holidays = holidays.KR()
+            data['공휴일'] = data['날짜'].dt.date.apply(lambda x: 1 if x in kr_holidays else 0)
+        except Exception:
+            data['공휴일'] = 0
+        # 업무일: 공휴일이 아닌 평일(월~금)
+        data['요일숫자'] = data['날짜'].dt.weekday
+        data['업무일'] = ((data['요일숫자'] < 5) & (data['공휴일'] == 0)).astype(int)
+        # 기존 평일 컬럼이 없으면 업무일 기준으로 생성
         if '평일' not in data.columns:
-            data['평일'] = np.where(data['날짜'].dt.weekday < 5, '평일', '주말')
+            data['평일'] = np.where(data['업무일'] == 1, '평일', '휴일')
     except Exception:
         pass
     
@@ -935,13 +945,16 @@ with st.spinner("데이터를 전처리 중..."):
             # 최종적으로 '평일' 또는 '휴일' 두 값만 유지, 이외는 요일로 보정
             mask_unexpected = ~normalized.isin(['평일', '휴일'])
             if mask_unexpected.any():
-                normalized.loc[mask_unexpected] = np.where(data.loc[mask_unexpected, '날짜'].dt.weekday < 5, '평일', '휴일')
+                normalized.loc[mask_unexpected] = np.where(
+                    ((data.loc[mask_unexpected, '날짜'].dt.weekday < 5) & (data.loc[mask_unexpected, '공휴일'] == 0)),
+                    '평일', '휴일'
+                )
             data['평일'] = normalized
     except Exception:
         pass
     
     # 필수 컬럼 확인 (유연하게 처리)
-    required_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '평일', '체감온도']
+    required_columns = ['최고기온', '평균기온', '최저기온', '최대수요', '체감온도']  # '평일'은 내부 계산으로 대체 가능
     missing_columns = [col for col in required_columns if col not in data.columns]
     
     if missing_columns:
@@ -989,19 +1002,20 @@ with st.spinner("특징 공학을 수행 중..."):
     data['연도'] = data['날짜'].dt.year
     # 공휴일 플래그는 사용하지 않음 (평일 컬럼 '평일/휴일'에 통합)
     
-    # 요일 더미 생성(모든 요일 포함), 평일은 수동 이진 플래그로 처리(값: '평일' 또는 '휴일')
+    # 요일 더미 생성(모든 요일 포함), 평일은 수동 이진 플래그로 처리(업무일 기준)
     data_processed = pd.get_dummies(data, columns=['요일'], drop_first=False)
     try:
-        if '평일' in data.columns:
-            # 표준화된 '평일' 값을 기준으로 이진 플래그 생성
-            data_processed['평일_평일'] = (data['평일'].astype(str) == '평일').astype(int)
-        else:
-            # 백업: 요일로 추정 (주말/휴일=0)
-            data_processed['평일_평일'] = (data['날짜'].dt.weekday < 5).astype(int)
+        # 업무일(공휴일이 아닌 평일) 기준 플래그 사용
+        data_processed['평일_평일'] = data['업무일'].astype(int) if '업무일' in data.columns else ((data['날짜'].dt.weekday < 5).astype(int))
+        # 공휴일 플래그도 보존(모델 입력 여부는 features_max 구성에 따름)
+        data_processed['공휴일'] = data.get('공휴일', 0)
     except Exception:
         data_processed['평일_평일'] = 0
-    # 어제 수요 래그
-    data_processed['어제의_최대수요'] = data_processed['최대수요'].shift(1)
+    # 어제 수요 래그 (t-1)
+    try:
+        data_processed['어제의_최대수요'] = pd.to_numeric(data_processed['최대수요'], errors='coerce').shift(1)
+    except Exception:
+        data_processed['어제의_최대수요'] = 0.0
     
     # 계절별 온도 특징 생성 (유연하게 처리)
     try:
@@ -1045,7 +1059,7 @@ with st.spinner("특징 공학을 수행 중..."):
         try:
             # 7일평균 제거 요청으로 생성하지 않음
             data_processed['전주동일요일_최대수요'] = data_processed['최대수요'].shift(7)
-            # 작년 동일월의 같은 요일 평균만 사용하여 작년동일일_최대수요 생성
+            # 작년 동일월의 같은 요일 평균만 사용하여 작년동일요일_최대수요 생성
             try:
                 # 먼저 (전년도) 월×요일 평균 맵을 준비했다고 가정하고, 없으면 지금 생성
                 ly_map = st.session_state.get('last_year_month_weekday_mean_max')
@@ -1063,13 +1077,13 @@ with st.spinner("특징 공학을 수행 중..."):
                         ly_map = {}
 
                 if ly_map and '월' in data_processed.columns and '요일' in data_processed.columns:
-                    data_processed['작년동일일_최대수요'] = [
+                    data_processed['작년동일요일_최대수요'] = [
                         float(ly_map.get((int(m), str(w)), 0.0)) for m, w in zip(data_processed['월'], data_processed['요일'])
                     ]
                 else:
-                    data_processed['작년동일일_최대수요'] = 0.0
+                    data_processed['작년동일요일_최대수요'] = 0.0
             except Exception:
-                data_processed['작년동일일_최대수요'] = 0.0
+                data_processed['작년동일요일_최대수요'] = 0.0
             # 작년 월-요일 평균 맵(예측 시 사용할 백업)
             try:
                 # 가장 최근 연도의 직전 연도 기준으로 평균 생성
@@ -1200,7 +1214,7 @@ st.header("🎯 Step 3: 모델 변수 및 데이터 분리")
 include_avg_temp_feature = False
 
 # [최대수요 모델] (여름철에는 체감온도 사용)
-_base_max = ['냉방강도', '난방강도', '월', '어제의_최대수요', '전주동일요일_최대수요', '작년동일일_최대수요']
+_base_max = ['냉방강도', '난방강도', '월', '어제의_최대수요', '전주동일요일_최대수요', '작년동일요일_최대수요', '공휴일', '업무일']
 if include_avg_temp_feature:
     _base_max.insert(1, '평균기온')
 
@@ -1213,7 +1227,7 @@ _dummies = [col for col in data_processed if col.startswith('요일_') or col.st
 features_max = _base_max + _temp_extras + _dummies
 
 # 학습 직전 결측 보정: 어제/7일평균/전주동일 컬럼이 없거나 NaN인 경우 0으로 대체
-for lag_col in ['어제의_최대수요', '전주동일요일_최대수요', '작년동일일_최대수요']:
+for lag_col in ['어제의_최대수요', '전주동일요일_최대수요', '작년동일요일_최대수요']:
     if lag_col in data_processed.columns:
         data_processed[lag_col] = pd.to_numeric(data_processed[lag_col], errors='coerce').fillna(0)
 
@@ -1555,11 +1569,11 @@ if predict_button:
                     buf.append(y_hat)
                     if len(buf) > 14:
                         buf.pop(0)
-                    # 동적 특징 업데이트 (7일평균 제거)
-                    dyn_work['어제의_최대수요'] = buf[-1]
-                    dyn_work['전주동일요일_최대수요'] = buf[-7] if len(buf) >= 7 else dyn_work.get('전주동일요일_최대수요', 0.0)
-                    # 작년동일일: 학습 시 정적 피처로만 사용하므로 재귀 단계에서는 0 유지
-                    dyn_work['작년동일일_최대수요'] = dyn_work.get('작년동일일_최대수요', 0.0)
+                # 동적 특징 업데이트 (t-1, t-7)
+                dyn_work['어제의_최대수요'] = buf[-1]
+                dyn_work['전주동일요일_최대수요'] = buf[-7] if len(buf) >= 7 else dyn_work.get('전주동일요일_최대수요', 0.0)
+                    # 작년동일요일: 학습 시 정적 피처로만 사용하므로 재귀 단계에서는 0 유지
+                dyn_work['작년동일요일_최대수요'] = dyn_work.get('작년동일요일_최대수요', 0.0)
                 predicted_max = forecast_series[0]
             
             st.success("✅ 예측 완료!")
@@ -1684,7 +1698,7 @@ if predict_detailed_button:
                 '월': selected_month_detailed,
                 '어제의_최대수요': dyn.get('어제의_최대수요', 0.0),
                 '전주동일요일_최대수요': dyn.get('전주동일요일_최대수요', 0.0),
-                '작년동일일_최대수요': dyn.get('작년동일일_최대수요', 0.0),
+                '작년동일요일_최대수요': dyn.get('작년동일요일_최대수요', 0.0),
                 # 계절별 추가 온도: 여름=최고기온 포함, 겨울=최저기온 포함
                 '최고기온': max_temp if is_summer_detailed else 0.0,
                 '최저기온': min_temp if is_winter_detailed else 0.0,
@@ -1753,7 +1767,11 @@ if predict_detailed_button:
 # --- 날짜 기반 예측 ---
 st.markdown("---")
 st.subheader("📅 날짜 기반 예측")
-st.info("특정 날짜를 선택하면 해당 날짜의 요일/평일/시즌 및 래그(t-1, t-7, 작년 동일일)를 기준으로 예측합니다. 온도는 시트에 값이 있으면 자동 사용, 없으면 입력값을 사용합니다.")
+st.info(
+    "선택한 날짜의 요일·공휴일·업무일·월(시즌)을 반영하고, 래그는 어제(t-1), 전주 동일 요일(t-7), 작년 동일 요일(전년도 월×요일 평균)을 사용합니다. "
+    "온도는 시트 값이 있으면 자동 사용, 없으면 입력값을 사용합니다. 여름엔 최고기온, 겨울엔 최저기온/체감온도를 활용해 냉방/난방 강도를 계산하며, "
+    "요일은 원-핫, 업무일은 공휴일을 고려한 평일 플래그로 반영됩니다."
+)
 
 with st.form("date_based_forecast_form"):
     # 기본 날짜: 데이터 마지막 날짜 다음날, 없으면 오늘
@@ -1823,19 +1841,28 @@ if submit_date_forecast:
                 else:
                     feels_like_val = float((min_temp_val or 0.0 + max_temp_val or 0.0) / 2.0)
 
-            # 평일 플래그(시트 표준화 값 우선)
-            is_weekday_flag = 1
+            # 공휴일/업무일/평일 플래그 산출 (한국 공휴일 기준)
+            try:
+                kr_holidays = holidays.KR()
+            except Exception:
+                kr_holidays = {}
+            weekday_num = int(target_ts.weekday())
+            is_holiday_flag = 1 if target_ts.date() in kr_holidays else 0
+            is_business_day_flag = 1 if (weekday_num < 5 and is_holiday_flag == 0) else 0
+            # 기존 시트의 '평일' 값이 있다면 보정(단, 공휴일이면 우선적으로 휴일 처리)
             try:
                 if '평일' in data.columns:
                     row_today = data[pd.to_datetime(data['날짜'], errors='coerce').dt.date == target_ts.date()]
                     if not row_today.empty:
-                        is_weekday_flag = 1 if str(row_today['평일'].iloc[0]) == '평일' else 0
-                    else:
-                        is_weekday_flag = 1 if target_ts.weekday() < 5 else 0
-                else:
-                    is_weekday_flag = 1 if target_ts.weekday() < 5 else 0
+                        sheet_weekday = 1 if str(row_today['평일'].iloc[0]) == '평일' else 0
+                        if is_holiday_flag == 1:
+                            is_business_day_flag = 0
+                        else:
+                            is_business_day_flag = sheet_weekday
             except Exception:
-                is_weekday_flag = 1 if target_ts.weekday() < 5 else 0
+                pass
+            # 모델 입력용 단순 플래그
+            is_weekday_flag = is_business_day_flag
 
             # 래그 계산: 과거 관측에서 추출
             y_series = None
@@ -1849,10 +1876,6 @@ if submit_date_forecast:
                 y_series = pd.Series(dtype=float)
 
             # 어제(t-1)
-            try:
-                y_t1 = float(y_series.iloc[-1]) if len(y_series) > 0 else 0.0
-            except Exception:
-                y_t1 = 0.0
 
             # 7일 평균 제거 요청으로 미사용
 
@@ -1880,9 +1903,11 @@ if submit_date_forecast:
                 '냉방강도': max(0.0, (feels_like_val if max_temp_val is None else max_temp_val) - 25.0),
                 '난방강도': max(0.0, 10.0 - (min_temp_val if min_temp_val is not None else feels_like_val)),
                 '월': month_val,
-                '어제의_최대수요': y_t1,
+                '어제의_최대수요': float(y_series.iloc[-1]) if 'y_series' in locals() and len(y_series) > 0 else 0.0,
                 '전주동일요일_최대수요': y_t7,
-                '작년동일일_최대수요': ly_val,
+                '작년동일요일_최대수요': ly_val,
+                '공휴일': int(is_holiday_flag),
+                '업무일': int(is_business_day_flag),
                 '최고기온': (max_temp_val if max_temp_val is not None else feels_like_val) if is_summer else 0.0,
                 '최저기온': (min_temp_val if min_temp_val is not None else feels_like_val) if is_winter else 0.0,
                 '체감온도': feels_like_val,
@@ -1904,6 +1929,43 @@ if submit_date_forecast:
                 base_val = y_t7
                 delta = predicted_by_date - base_val
                 st.metric("전주 동일 요일 대비", f"{delta:,.0f} MW", delta=delta)
+            except Exception:
+                pass
+
+            # 작년 동일 주 요일별 최대수요(2/29는 2/28로 대체) 표시
+            try:
+                prev_year = int(target_ts.year) - 1
+                try:
+                    anchor = target_ts.replace(year=prev_year)
+                except Exception:
+                    if int(target_ts.month) == 2 and int(target_ts.day) == 29:
+                        anchor = pd.Timestamp(year=prev_year, month=2, day=28)
+                    else:
+                        anchor = target_ts - pd.Timedelta(days=365)
+
+                week_start = anchor - pd.Timedelta(days=int(anchor.weekday()))
+                week_dates = [week_start + pd.Timedelta(days=i) for i in range(7)]
+
+                df_lookup = data.copy()
+                df_lookup['날짜'] = pd.to_datetime(df_lookup['날짜'], errors='coerce')
+                weekday_map_disp = {0: '월요일', 1: '화요일', 2: '수요일', 3: '목요일', 4: '금요일', 5: '토요일', 6: '일요일'}
+
+                rows = []
+                for dti in week_dates:
+                    mask = df_lookup['날짜'].dt.date == dti.date()
+                    if mask.any() and '최대수요' in df_lookup.columns:
+                        val = pd.to_numeric(df_lookup.loc[mask, '최대수요'], errors='coerce').iloc[0]
+                    else:
+                        val = np.nan
+                    rows.append({
+                        '요일': weekday_map_disp[int(dti.weekday())],
+                        '날짜': dti.strftime('%Y-%m-%d'),
+                        '최대수요': val,
+                    })
+
+                df_same_week = pd.DataFrame(rows)
+                st.subheader("📅 작년 동일 주 요일별 최대수요")
+                st.dataframe(df_same_week, use_container_width=True)
             except Exception:
                 pass
 
