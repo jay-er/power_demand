@@ -136,6 +136,8 @@ st.set_page_config(
 # 제목
 st.title("⚡ 전력 수요 예측 시스템")
 st.markdown("---")
+# 전역 스피너 플레이스홀더 (모델 학습 시 상단에만 표시)
+train_spinner = st.empty()
 
 # 전역 변수 초기화
 if 'mae_max' not in st.session_state:
@@ -627,6 +629,9 @@ def save_data_to_sheet(client, data, sheet_name="power_data", sheet_id=None, ori
 
 # 사이드바 제거됨 (요청에 따라 비표시)
 
+# 전역 로딩 상태 표시 플레이스홀더 (Step 0 위)
+global_status_placeholder = st.empty()
+
 # --- 0. 데이터 로딩 및 편집 ---
 st.header("📁 Step 0: 데이터 로딩 및 편집")
 
@@ -898,8 +903,10 @@ with tab3:
 st.markdown("---")
 
 # --- 1. 데이터 준비 ---
-st.header("📋 Step 1: 데이터 준비")
-with st.spinner("데이터를 전처리 중..."):
+with st.expander("📋 Step 1: 데이터 준비", expanded=False):
+    with st.spinner("데이터를 전처리 중..."):
+        # NOTE: 실제 전처리 코드는 아래에 있으며, 구문 오류 방지를 위해 본 블록에 최소 본문을 둡니다.
+        pass
     # 날짜 컬럼 변환
     if '날짜' in data.columns:
         data['날짜'] = pd.to_datetime(data['날짜'])
@@ -995,22 +1002,25 @@ with st.spinner("데이터를 전처리 중..."):
 st.markdown("---")
 
 # --- 2. 특징 공학 및 데이터 정제 ---
-st.header("🔧 Step 2: 특징 공학 및 데이터 정제")
-with st.spinner("특징 공학을 수행 중..."):
+with st.expander("🔧 Step 2: 특징 공학 및 데이터 정제", expanded=False):
+    with st.spinner("특징 공학을 수행 중..."):
+        # NOTE: 실제 특징 공학 코드는 아래에 있으며, 구문 오류 방지를 위해 본 블록에 최소 본문을 둡니다.
+        pass
     data['월'] = data['날짜'].dt.month
     data['일'] = data['날짜'].dt.day
     data['연도'] = data['날짜'].dt.year
     # 공휴일 플래그는 사용하지 않음 (평일 컬럼 '평일/휴일'에 통합)
     
-    # 요일 더미 생성(모든 요일 포함), 평일은 수동 이진 플래그로 처리(업무일 기준)
+    # 요일 더미 생성(모든 요일 포함)
     data_processed = pd.get_dummies(data, columns=['요일'], drop_first=False)
     try:
-        # 업무일(공휴일이 아닌 평일) 기준 플래그 사용
-        data_processed['평일_평일'] = data['업무일'].astype(int) if '업무일' in data.columns else ((data['날짜'].dt.weekday < 5).astype(int))
         # 공휴일 플래그도 보존(모델 입력 여부는 features_max 구성에 따름)
         data_processed['공휴일'] = data.get('공휴일', 0)
+        # 업무일은 이미 data에 생성되어 있음
+        if '업무일' in data.columns:
+            data_processed['업무일'] = data['업무일'].astype(int)
     except Exception:
-        data_processed['평일_평일'] = 0
+        pass
     # 어제 수요 래그 (t-1)
     try:
         data_processed['어제의_최대수요'] = pd.to_numeric(data_processed['최대수요'], errors='coerce').shift(1)
@@ -1141,10 +1151,11 @@ with st.spinner("특징 공학을 수행 중..."):
             denom_total = data_processed['최대수요'].replace(0, np.nan)
             total_ratio = (data_processed['가스수요'] + data_processed['태양광최대']) / denom_total
             # 평일 플래그 파생 (원-핫이 있으면 사용, 없으면 원본에서 유도)
-            if '평일_평일' in data_processed.columns:
-                is_weekday_series = data_processed['평일_평일']
+            # 평일_평일 제거: 업무일(공휴일 고려)로 대체
+            if '업무일' in data_processed.columns:
+                is_weekday_series = data_processed['업무일']
             else:
-                is_weekday_series = (data['평일'] == '평일').astype(int) if '평일' in data.columns else pd.Series(0, index=data_processed.index)
+                is_weekday_series = ((data['날짜'].dt.weekday < 5) & (~data['날짜'].dt.date.isin(holidays.KR()))).astype(int)
 
             weekday_mean = total_ratio[is_weekday_series == 1].mean()
             weekend_mean = total_ratio[is_weekday_series == 0].mean()
@@ -1207,98 +1218,97 @@ with st.spinner("특징 공학을 수행 중..."):
 
 st.markdown("---")
 
-# --- 3. 모델 변수 및 데이터 분리 ---
-st.header("🎯 Step 3: 모델 변수 및 데이터 분리")
+ # --- 3. 모델 변수 및 데이터 분리 ---
+with st.expander("🎯 Step 3: 모델 변수 및 데이터 분리", expanded=False):
+    # 평균기온을 모델 특징에 사용하지 않음 (향후 필요 시 True로 변경할 수 있도록 변수만 유지)
+    include_avg_temp_feature = False
 
-# 평균기온을 모델 특징에 사용하지 않음 (향후 필요 시 True로 변경할 수 있도록 변수만 유지)
-include_avg_temp_feature = False
+    # [최대수요 모델] (여름철에는 체감온도 사용)
+    _base_max = ['냉방강도', '난방강도', '월', '어제의_최대수요', '전주동일요일_최대수요', '작년동일요일_최대수요', '공휴일', '업무일']
+    if include_avg_temp_feature:
+        _base_max.insert(1, '평균기온')
 
-# [최대수요 모델] (여름철에는 체감온도 사용)
-_base_max = ['냉방강도', '난방강도', '월', '어제의_최대수요', '전주동일요일_최대수요', '작년동일요일_최대수요', '공휴일', '업무일']
-if include_avg_temp_feature:
-    _base_max.insert(1, '평균기온')
+    # 추가로 최저/최고/체감/일교차까지 함께 사용 (존재하는 경우만)
+    _temp_extras = [f for f in ['최고기온', '최저기온', '체감온도', '일교차'] if f in data_processed.columns]
 
-# 추가로 최저/최고/체감/일교차까지 함께 사용 (존재하는 경우만)
-_temp_extras = [f for f in ['최고기온', '최저기온', '체감온도', '일교차'] if f in data_processed.columns]
+    # 요일 더미 포함 (평일_평일 제거)
+    _dummies = [col for col in data_processed if col.startswith('요일_')]
 
-# 요일, 평일 더미 포함
-_dummies = [col for col in data_processed if col.startswith('요일_') or col.startswith('평일_')]
+    features_max = _base_max + _temp_extras + _dummies
 
-features_max = _base_max + _temp_extras + _dummies
+    # 학습 직전 결측 보정: 어제/7일평균/전주동일 컬럼이 없거나 NaN인 경우 0으로 대체
+    for lag_col in ['어제의_최대수요', '전주동일요일_최대수요', '작년동일요일_최대수요']:
+        if lag_col in data_processed.columns:
+            data_processed[lag_col] = pd.to_numeric(data_processed[lag_col], errors='coerce').fillna(0)
 
-# 학습 직전 결측 보정: 어제/7일평균/전주동일 컬럼이 없거나 NaN인 경우 0으로 대체
-for lag_col in ['어제의_최대수요', '전주동일요일_최대수요', '작년동일요일_최대수요']:
-    if lag_col in data_processed.columns:
-        data_processed[lag_col] = pd.to_numeric(data_processed[lag_col], errors='coerce').fillna(0)
+    # 온도 관련 피처 존재 시 숫자 변환 및 결측 허용(모델이 분할에서 사용하지 않으면 영향 적음)
+    for temp_col in ['최고기온', '최저기온', '체감온도', '일교차', '냉방강도', '난방강도']:
+        if temp_col in data_processed.columns:
+            data_processed[temp_col] = pd.to_numeric(data_processed[temp_col], errors='coerce')
 
-# 온도 관련 피처 존재 시 숫자 변환 및 결측 허용(모델이 분할에서 사용하지 않으면 영향 적음)
-for temp_col in ['최고기온', '최저기온', '체감온도', '일교차', '냉방강도', '난방강도']:
-    if temp_col in data_processed.columns:
-        data_processed[temp_col] = pd.to_numeric(data_processed[temp_col], errors='coerce')
-
-X_max = data_processed[features_max].copy()
-y_max = pd.to_numeric(data_processed['최대수요'], errors='coerce')
+    X_max = data_processed[features_max].copy()
+    y_max = pd.to_numeric(data_processed['최대수요'], errors='coerce')
 
 # X, y 동시 결측 제거(필요 최소 범위)
-valid_mask = ~y_max.isna()
-for c in X_max.columns:
-    valid_mask &= ~X_max[c].isna()
-X_max = X_max[valid_mask]
-y_max = y_max[valid_mask]
+    valid_mask = ~y_max.isna()
+    for c in X_max.columns:
+        valid_mask &= ~X_max[c].isna()
+    X_max = X_max[valid_mask]
+    y_max = y_max[valid_mask]
 
 # 최저수요 모델 제거 - 최대수요 모델만 사용
 
 # 고정된 파라미터 사용
-test_size = 0.2
-n_estimators = 100
-random_state = 42
+    test_size = 0.2
+    n_estimators = 100
+    random_state = 42
 
 # 단일 모델용 데이터 분할 - 시간순 분할 (평일/주말 분리 제거)
-X_max_train, X_max_test, y_max_train, y_max_test = chronological_split(
-    X_max, y_max, pd.to_datetime(data.loc[X_max.index, '날짜'], errors='coerce'), test_size=test_size
-)
+    X_max_train, X_max_test, y_max_train, y_max_test = chronological_split(
+        X_max, y_max, pd.to_datetime(data.loc[X_max.index, '날짜'], errors='coerce'), test_size=test_size
+    )
 
 # 변수 정보 표시
-st.subheader("📈 최대수요 모델 변수")
-st.write(f"특징 변수: {len(features_max)}개")
-# 표시용 이름 매핑: '냉방강도'/'난방강도'를 직관적으로 표시
-_display_name_map = {
-    '냉방강도': '냉방강도(>25°C)',
-    '난방강도': '난방강도(<10°C)',
-}
+    st.subheader("📈 최대수요 모델 변수")
+    st.write(f"특징 변수: {len(features_max)}개")
+    # 표시용 이름 매핑: '냉방강도'/'난방강도'를 직관적으로 표시
+    _display_name_map = {
+        '냉방강도': '냉방강도(>25°C)',
+        '난방강도': '난방강도(<10°C)',
+    }
 
 # UI 표시용으로만 요일 더미를 월→일 순서로 재배치
-weekday_display_order = [
-    '요일_월요일', '요일_화요일', '요일_수요일', '요일_목요일',
-    '요일_금요일', '요일_토요일', '요일_일요일'
-]
-weekday_cols_present = [c for c in features_max if c.startswith('요일_')]
-weekday_cols_ordered = [c for c in weekday_display_order if c in weekday_cols_present]
-non_weekday_cols = [c for c in features_max if not c.startswith('요일_')]
-features_max_display_ordered = non_weekday_cols + weekday_cols_ordered
+    weekday_display_order = [
+        '요일_월요일', '요일_화요일', '요일_수요일', '요일_목요일',
+        '요일_금요일', '요일_토요일', '요일_일요일'
+    ]
+    weekday_cols_present = [c for c in features_max if c.startswith('요일_')]
+    weekday_cols_ordered = [c for c in weekday_display_order if c in weekday_cols_present]
+    non_weekday_cols = [c for c in features_max if not c.startswith('요일_')]
+    features_max_display_ordered = non_weekday_cols + weekday_cols_ordered
 
-display_features_max = [_display_name_map.get(name, name) for name in features_max_display_ordered]
-# 헤더 행을 사용한 한 줄 표
-max_vars_df = pd.DataFrame([display_features_max], columns=[f'변수{i+1}' for i in range(len(display_features_max))])
-st.dataframe(max_vars_df, use_container_width=True)
+    display_features_max = [_display_name_map.get(name, name) for name in features_max_display_ordered]
+    # 헤더 행을 사용한 한 줄 표
+    max_vars_df = pd.DataFrame([display_features_max], columns=[f'변수{i+1}' for i in range(len(display_features_max))])
+    st.dataframe(max_vars_df, use_container_width=True)
 
-# 요일 더미 기준 범주 안내 (drop_first=True로 인해 표에서 빠진 요일)
-try:
-    existing_weekday_dummy_cols = [c for c in data_processed.columns if c.startswith('요일_')]
-    all_weekdays = ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']
-    baseline_weekdays = [d for d in all_weekdays if f'요일_{d}' not in existing_weekday_dummy_cols]
-    if len(baseline_weekdays) > 0:
-        st.caption(f"요일 원-핫은 다중공선성 방지를 위해 기준 범주가 1개 빠집니다 (기준: {', '.join(baseline_weekdays)}). 모델에는 기준 요일도 정상 반영됩니다.")
-except Exception:
-    pass
+    # 요일 더미 기준 범주 안내 (drop_first=True로 인해 표에서 빠진 요일)
+    try:
+        existing_weekday_dummy_cols = [c for c in data_processed.columns if c.startswith('요일_')]
+        all_weekdays = ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']
+        baseline_weekdays = [d for d in all_weekdays if f'요일_{d}' not in existing_weekday_dummy_cols]
+        if len(baseline_weekdays) > 0:
+            st.caption(f"요일 원-핫은 다중공선성 방지를 위해 기준 범주가 1개 빠집니다 (기준: {', '.join(baseline_weekdays)}). 모델에는 기준 요일도 정상 반영됩니다.")
+    except Exception:
+        pass
 
 
 
-# 가스수요 모델 변수 (가능한 경우)
-if '가스수요' in data_processed.columns and '태양광최대' in data_processed.columns:
-    st.subheader("🔥 가스수요 모델 변수")
-    # 최소·핵심 피처 위주 구성 (다중공선성/누설 위험 낮춤)
-    features_gas = [
+    # 가스수요 모델 변수 (가능한 경우)
+    if '가스수요' in data_processed.columns and '태양광최대' in data_processed.columns:
+        st.subheader("🔥 가스수요 모델 변수")
+        # 최소·핵심 피처 위주 구성 (다중공선성/누설 위험 낮춤)
+        features_gas = [
         '최대수요',          # 총 스케일
         '태양광최대',        # 대체관계 핵심
         '잔여부하',          # 잔여 총량
@@ -1307,32 +1317,32 @@ if '가스수요' in data_processed.columns and '태양광최대' in data_proces
         '목표가스_예산',      # 평일/주말 총비율 예산
         '어제의_가스수요',     # 래그
         '어제의_가스수요_변화율',# 래그 변화율(누설 방지)
-        '평일_평일'          # 평일/주말 효과
+        '업무일'             # 평일/주말(공휴일 고려) 효과
     ]
-    available_gas_features = [col for col in features_gas if col in data_processed.columns]
+        available_gas_features = [col for col in features_gas if col in data_processed.columns]
     
-    if len(available_gas_features) >= 2:  # 최소 2개 변수 필요
-        X_gas = data_processed[available_gas_features]
-        y_gas = data_processed['가스수요']
+        if len(available_gas_features) >= 2:  # 최소 2개 변수 필요
+            X_gas = data_processed[available_gas_features]
+            y_gas = data_processed['가스수요']
         
         # 가스수요 데이터 분할 - 시간순 분할 (태양광최대는 2024-12-01 이후 데이터만 학습 사용)
-        try:
-            gas_date_series = pd.to_datetime(data_processed.loc[X_gas.index, '날짜'], errors='coerce')
-            cutoff = pd.Timestamp('2024-12-01')
-            mask_after_cutoff = gas_date_series >= cutoff
-            X_gas = X_gas[mask_after_cutoff]
-            y_gas = y_gas[mask_after_cutoff]
-            gas_date_series = gas_date_series[mask_after_cutoff]
-        except Exception:
-            pass
+            try:
+                gas_date_series = pd.to_datetime(data_processed.loc[X_gas.index, '날짜'], errors='coerce')
+                cutoff = pd.Timestamp('2024-12-01')
+                mask_after_cutoff = gas_date_series >= cutoff
+                X_gas = X_gas[mask_after_cutoff]
+                y_gas = y_gas[mask_after_cutoff]
+                gas_date_series = gas_date_series[mask_after_cutoff]
+            except Exception:
+                pass
 
-        X_gas_train, X_gas_test, y_gas_train, y_gas_test = chronological_split(
-            X_gas, y_gas, gas_date_series if 'gas_date_series' in locals() else data_processed.loc[X_gas.index, '날짜'], test_size=test_size
-        )
+            X_gas_train, X_gas_test, y_gas_train, y_gas_test = chronological_split(
+                X_gas, y_gas, gas_date_series if 'gas_date_series' in locals() else data_processed.loc[X_gas.index, '날짜'], test_size=test_size
+            )
         
-        st.write(f"특징 변수: {len(available_gas_features)}개")
-        gas_vars_df = pd.DataFrame([available_gas_features], columns=[f'변수{i+1}' for i in range(len(available_gas_features))])
-        st.dataframe(gas_vars_df, use_container_width=True)
+            st.write(f"특징 변수: {len(available_gas_features)}개")
+            gas_vars_df = pd.DataFrame([available_gas_features], columns=[f'변수{i+1}' for i in range(len(available_gas_features))])
+            st.dataframe(gas_vars_df, use_container_width=True)
         
         # 세션 상태에 저장 (단일 전체 세트)
         st.session_state.X_gas_train = X_gas_train
@@ -1342,9 +1352,9 @@ if '가스수요' in data_processed.columns and '태양광최대' in data_proces
         st.session_state.features_gas = available_gas_features
 
         # 평일/주말 분리 세트 생성
-        if '평일_평일' in data_processed.columns:
+        if '업무일' in data_processed.columns:
             try:
-                mask_weekday = data_processed['평일_평일'] == 1
+                mask_weekday = data_processed['업무일'] == 1
             except Exception:
                 mask_weekday = pd.Series(False, index=data_processed.index)
         else:
@@ -1389,17 +1399,26 @@ if '가스수요' in data_processed.columns and '태양광최대' in data_proces
             else:
                 st.warning("⚠️ 평일/주말 분리 학습을 위한 표본 수가 부족합니다. 단일 모델로 학습합니다.")
         except Exception:
-            st.warning("⚠️ 평일/주말 분리 데이터 생성 중 오류가 발생하여 단일 모델로 진행합니다.")
+                st.warning("⚠️ 평일/주말 분리 데이터 생성 중 오류가 발생하여 단일 모델로 진행합니다.")
+        else:
+            st.warning("⚠️ 가스수요 예측을 위한 충분한 변수가 없습니다.")
     else:
-        st.warning("⚠️ 가스수요 예측을 위한 충분한 변수가 없습니다.")
-else:
-    st.info("ℹ️ 가스수요 예측을 위한 컬럼이 없습니다.")
+        st.info("ℹ️ 가스수요 예측을 위한 컬럼이 없습니다.")
 
 st.markdown("---")
 
 # --- 4. 모델 학습 (단일 모델) ---
-st.header("🤖 Step 4: 모델 학습")
-with st.spinner("모델을 학습 중..."):
+with st.expander("🤖 Step 4: 모델 학습", expanded=False):
+    # 전역 로딩 켜기 (상단 배너 표시)
+    if not st.session_state.get('is_training', False):
+        st.session_state.is_training = True
+        # 상단 배너 표시
+        with global_status_placeholder.container():
+            st.info("⏳ Step 4/5: 모델 학습 및 성능 평가 진행 중...")
+
+    with st.spinner("모델을 학습 중..."):
+        # NOTE: 실제 학습 코드는 아래에 있으며, 구문 오류 방지를 위해 본 블록에 최소 본문을 둡니다.
+        pass
     st.subheader("📈 단일 모델 학습")
     # 단일 모델 학습 (간단 튜닝 적용)
     try:
@@ -1440,35 +1459,42 @@ with st.spinner("모델을 학습 중..."):
 
 st.markdown("---")
 
-# --- 5. 모델 성능 평가 ---
-st.header("📊 Step 5: 모델 성능 평가")
-with st.spinner("성능을 평가 중..."):
-    st.subheader("📈 단일 모델 성능 (검증 세트)")
-    y_pred = rf_max.predict(X_max_test)
-    st.session_state.mae_max = mean_absolute_error(y_max_test, y_pred)
-    st.session_state.r2_max = r2_score(y_max_test, y_pred)
+ # --- 5. 모델 성능 평가 ---
+with st.expander("📊 Step 5: 모델 성능 평가", expanded=False):
+    with st.spinner("성능을 평가 중..."):
+        st.subheader("📈 단일 모델 성능 (검증 세트)")
+        y_pred = rf_max.predict(X_max_test)
+        st.session_state.mae_max = mean_absolute_error(y_max_test, y_pred)
+        st.session_state.r2_max = r2_score(y_max_test, y_pred)
     
     # 가스수요 단일 모델 성능 평가
-    if hasattr(st.session_state, 'gas_model') and hasattr(st.session_state, 'X_gas_test'):
-        y_gas_pred = st.session_state.gas_model.predict(st.session_state.X_gas_test)
-        st.session_state.mae_gas = mean_absolute_error(st.session_state.y_gas_test, y_gas_pred)
-        st.session_state.r2_gas = r2_score(st.session_state.y_gas_test, y_gas_pred)
+        if hasattr(st.session_state, 'gas_model') and hasattr(st.session_state, 'X_gas_test'):
+            y_gas_pred = st.session_state.gas_model.predict(st.session_state.X_gas_test)
+            st.session_state.mae_gas = mean_absolute_error(st.session_state.y_gas_test, y_gas_pred)
+            st.session_state.r2_gas = r2_score(st.session_state.y_gas_test, y_gas_pred)
 
-# 성능 결과 표시 (최대수요 / 가스수요 나란히)
-if hasattr(st.session_state, 'mae_gas') and hasattr(st.session_state, 'r2_gas'):
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("📈 최대수요 예측 모델 성능")
-        st.metric("검증 MAE", f"{st.session_state.mae_max:,.0f} MW")
-        st.metric("검증 R²", f"{st.session_state.r2_max:.4f}")
-    with col2:
-        st.subheader("🔥 가스수요 예측 모델 성능")
-        st.metric("검증 MAE", f"{st.session_state.mae_gas:,.0f} MW")
-        st.metric("검증 R²", f"{st.session_state.r2_gas:.4f}")
-else:
-    st.subheader("📈 최대수요 예측 모델 성능")
-    st.metric("검증 MAE", f"{st.session_state.mae_max:,.0f} MW")
-    st.metric("검증 R²", f"{st.session_state.r2_max:.4f}")
+        # 성능 결과 표시 (최대수요 / 가스수요 나란히)
+        if hasattr(st.session_state, 'mae_gas') and hasattr(st.session_state, 'r2_gas'):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("📈 최대수요 예측 모델 성능")
+                st.metric("검증 MAE", f"{st.session_state.mae_max:,.0f} MW")
+                st.metric("검증 R²", f"{st.session_state.r2_max:.4f}")
+            with col2:
+                st.subheader("🔥 가스수요 예측 모델 성능")
+                st.metric("검증 MAE", f"{st.session_state.mae_gas:,.0f} MW")
+                st.metric("검증 R²", f"{st.session_state.r2_gas:.4f}")
+        else:
+            st.subheader("📈 최대수요 예측 모델 성능")
+            st.metric("검증 MAE", f"{st.session_state.mae_max:,.0f} MW")
+            st.metric("검증 R²", f"{st.session_state.r2_max:.4f}")
+
+    # 전역 로딩 끄기 및 상단 배너 제거
+    if st.session_state.get('is_training', False):
+        st.session_state.is_training = False
+        global_status_placeholder.empty()
+
+ 
 
 # 그래프 비표시(요청에 따라 검증 라인차트 생략)
 
@@ -1476,293 +1502,11 @@ st.markdown("---")
 
 # --- 6. 전력 수요 예측 ---
 st.header("🔮 Step 6: 전력 수요 예측")
-st.info("요일과 체감온도를 입력하고 예측 기간을 선택하여 최대수요를 예측합니다.")
 
 # 예측 입력 폼
 col1, col2 = st.columns(2)
 
-with col1:
-    st.subheader("📝 예측 조건 입력")
-    
-    # 요일 선택
-    weekday_options = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
-    selected_weekday = st.selectbox("요일 선택", weekday_options, index=0)
-    
-    # 체감온도 입력 (여름/겨울 적용)
-    feels_like_simple = st.number_input("체감온도 (°C)", min_value=-50.0, max_value=50.0, value=20.0, step=0.1)
-    
-    # 월 선택 (계절성 고려)
-    month_options = list(range(1, 13))
-    selected_month = st.selectbox("월 선택", month_options, index=4)  # 5월 기본값
-    
-    # 예측 기간은 1일로 고정
-    horizon = 1
-    # 예측 버튼
-    predict_button = st.button("🔮 예측 실행", type="primary")
-
-with col2:
-    st.subheader("📊 입력 정보")
-    st.write(f"**선택된 요일:** {selected_weekday}")
-    st.write(f"**체감온도:** {feels_like_simple}°C")
-    st.write(f"**선택된 월:** {selected_month}월")
-
 # 예측 실행
-if predict_button:
-    try:
-        with st.spinner("예측을 수행 중..."):
-            # 평일/주말 + 요일 더미 구성 (예측 입력)
-            weekday_dummies = {}
-            # 평일/휴일 판단: 요일 기반(월~금=평일). 추후 UI로 직접 선택 가능
-            is_weekday = 1 if selected_weekday in ['월요일','화요일','수요일','목요일','금요일'] else 0
-            weekday_dummies['평일_평일'] = is_weekday
-            weekday_dummies.update({f'요일_{w}': (1 if w == selected_weekday else 0) for w in ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']})
-            
-            # 계절 판별
-            is_summer_sel = selected_month in [5, 6, 7, 8, 9]
-            is_winter_sel = selected_month in [10, 11, 12, 1, 2, 3, 4]
-
-            # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 체감온도 대용)
-            est_high = feels_like_simple
-            # 모델 선택(단일 모델)
-            model_max = rf_max
-            
-            def predict_one_day(feels_like_val: float, month_val: int, weekday_name: str, min_temp_val=None, max_temp_val=None) -> float:
-                dummies = {'평일_평일': 1 if weekday_name in ['월요일','화요일','수요일','목요일','금요일'] else 0}
-                dummies.update({f'요일_{w}': (1 if w == weekday_name else 0) for w in ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']})
-                feats = {
-                    # 냉방강도/난방강도 계산
-                    '냉방강도': max(0.0, (feels_like_val if max_temp_val is None else max_temp_val) - 25.0),
-                    '난방강도': max(0.0, 10.0 - (min_temp_val if min_temp_val is not None else feels_like_val)),
-                    '월': month_val,
-                    # 계절별 추가 온도: 여름=최고기온, 겨울=최저기온
-                    '최고기온': (max_temp_val if max_temp_val is not None else feels_like_val) if month_val in [5,6,7,8,9] else 0.0,
-                    '최저기온': (min_temp_val if min_temp_val is not None else feels_like_val) if month_val in [10,11,12,1,2,3,4] else 0.0,
-                    '체감온도': feels_like_val,
-                    '일교차': ( (max_temp_val - min_temp_val) if (max_temp_val is not None and min_temp_val is not None) else 0.0 ),
-                }
-                feats.update(dummies)
-                frame = pd.DataFrame([feats])
-                # 훈련 피처 집합과 정렬/보정
-                frame = align_features_for_model(model_max, frame)
-                return float(model_max.predict(frame)[0])
-
-            # 단일일 예측 또는 재귀 7일 예측
-            if horizon == 1:
-                predicted_max = predict_one_day(feels_like_simple, selected_month, selected_weekday)
-                forecast_series = [predicted_max]
-            else:
-                # 7일 재귀 예측: 매 스텝에서 래그/평균 업데이트
-                weekday_cycle = ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']
-                start_idx = weekday_cycle.index(selected_weekday)
-                # 시드 시계열 준비
-                tail = st.session_state.get('max_series_tail', [])
-                buf = list(tail)
-                if len(buf) < 14:
-                    buf = ([buf[0]] * (14 - len(buf)) + buf) if buf else [0.0]*14
-                forecast_series = []
-                dyn_work = dyn.copy()
-                for step in range(7):
-                    wd_name = weekday_cycle[(start_idx + step) % 7]
-                    y_hat = predict_one_day(feels_like_simple, selected_month, wd_name, dyn_work)
-                    forecast_series.append(y_hat)
-                    # 버퍼 업데이트 (최대 14개 유지)
-                    buf.append(y_hat)
-                    if len(buf) > 14:
-                        buf.pop(0)
-                # 동적 특징 업데이트 (t-1, t-7)
-                dyn_work['어제의_최대수요'] = buf[-1]
-                dyn_work['전주동일요일_최대수요'] = buf[-7] if len(buf) >= 7 else dyn_work.get('전주동일요일_최대수요', 0.0)
-                    # 작년동일요일: 학습 시 정적 피처로만 사용하므로 재귀 단계에서는 0 유지
-                dyn_work['작년동일요일_최대수요'] = dyn_work.get('작년동일요일_최대수요', 0.0)
-                predicted_max = forecast_series[0]
-            
-            st.success("✅ 예측 완료!")
-            
-            # 예측 결과 표시
-            st.subheader("🎯 예측 결과")
-            
-            if horizon == 1:
-                st.metric("예측 최대수요", f"{predicted_max:,.0f} MW")
-            else:
-                st.write("**예측 최대수요(7일):**")
-                st.dataframe(pd.DataFrame({
-                    '일차': list(range(1, len(forecast_series)+1)),
-                    '예측 최대수요': [f"{v:,.0f}" for v in forecast_series]
-                }), use_container_width=True)
-            
-            # 예측 결과 상세 정보
-            st.subheader("📋 예측 상세 정보")
-            base_items = ['요일', '체감온도', '월']
-            base_vals = [selected_weekday, f"{feels_like_simple}°C", f"{selected_month}월"]
-            if horizon == 1:
-                base_items.append('예측 최대수요')
-                base_vals.append(f"{predicted_max:,.0f} MW")
-            else:
-                base_items.append('예측 기간')
-                base_vals.append(f"{horizon}일")
-            prediction_info = pd.DataFrame({'항목': base_items, '값': base_vals})
-            st.dataframe(prediction_info, use_container_width=True)
-            
-            # 예측 신뢰도 (모델 성능 기반)
-            confidence_max = min(95, max(60, st.session_state.r2_max * 100))
-            
-            st.subheader("📊 예측 신뢰도")
-            st.metric("최대수요 예측 신뢰도", f"{confidence_max:.1f}%")
-            
-            # 예측 결과 시각화
-            st.subheader("📈 예측 결과 시각화")
-            
-            fig_prediction = go.Figure()
-            
-            # 최대수요만 막대 그래프로 표시
-            fig_prediction.add_trace(go.Bar(
-                x=['최대수요'],
-                y=[predicted_max],
-                name='예측 최대수요',
-                marker_color=['red']
-            ))
-            
-            fig_prediction.update_layout(
-                title=f"{selected_weekday} (체감 {feels_like_simple}°C) 최대수요 예측",
-                yaxis_title="전력 수요 (MW)",
-                showlegend=True
-            )
-            
-            st.plotly_chart(fig_prediction, use_container_width=True)
-            
-    except Exception as e:
-        st.error(f"❌ 예측 중 오류가 발생했습니다: {str(e)}")
-        st.info("모델 학습이 완료되지 않았거나 입력 데이터에 문제가 있을 수 있습니다.")
-
-# --- 새로운 예측 기능: 최저기온/최고기온 입력 ---
-st.markdown("---")
-st.subheader("🌡️ 상세 기온 기반 예측")
-st.info("최저기온, 최고기온, 체감온도를 직접 입력하여 더 정확한 최대수요 예측을 수행합니다.")
-
-# 새로운 예측 입력 폼
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("📝 상세 예측 조건 입력")
-    
-    # 요일 선택 (상세)
-    selected_weekday_detailed = st.selectbox("요일 선택", ['월요일','화요일','수요일','목요일','금요일','토요일','일요일'], index=0, key="weekday_detailed")
-    
-    # 최저기온 입력
-    min_temp = st.number_input("최저기온 (°C)", min_value=-50.0, max_value=50.0, value=15.0, step=0.1, key="min_temp")
-    
-    # 최고기온 입력
-    max_temp = st.number_input("최고기온 (°C)", min_value=-50.0, max_value=50.0, value=25.0, step=0.1, key="max_temp")
-    
-    # 체감온도 입력
-    feels_like_detailed = st.number_input("체감온도 (°C)", min_value=-50.0, max_value=50.0, value=(min_temp + max_temp) / 2, step=0.1, key="feels_like_detailed")
-
-    # 월 선택 (계절성 고려)
-    selected_month_detailed = st.selectbox("월 선택", month_options, index=4, key="month_detailed")  # 5월 기본값
-    
-    # 상세 예측 버튼
-    predict_detailed_button = st.button("🔮 상세 예측 실행", type="primary", key="predict_detailed")
-
-with col2:
-    st.subheader("📊 상세 입력 정보")
-    st.write(f"**선택된 요일:** {selected_weekday_detailed}")
-    st.write(f"**최저기온:** {min_temp}°C")
-    st.write(f"**최고기온:** {max_temp}°C")
-    st.write(f"**체감온도:** {feels_like_detailed}°C")
-
-    st.write(f"**선택된 월:** {selected_month_detailed}월")
-
-# 상세 예측 실행
-if predict_detailed_button:
-    try:
-        with st.spinner("상세 예측을 수행 중..."):
-
-            
-            # 평일/주말 + 요일 더미 구성 (상세 예측 입력)
-            weekday_dummies_detailed = {}
-            # 평일/휴일 판단: 요일 기반
-            is_weekday_detailed = 1 if selected_weekday_detailed in ['월요일','화요일','수요일','목요일','금요일'] else 0
-            weekday_dummies_detailed['평일_평일'] = is_weekday_detailed
-            weekday_dummies_detailed.update({f'요일_{w}': (1 if w == selected_weekday_detailed else 0) for w in ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']})
-            
-            # 계절 판별
-            is_summer_detailed = selected_month_detailed in [5, 6, 7, 8, 9]
-            is_winter_detailed = selected_month_detailed in [10, 11, 12, 1, 2, 3, 4]
-
-            # 최대수요 예측을 위한 특징 생성 (여름: 체감온도, 그 외: 실제 최고기온)
-            dyn = st.session_state.get('dynamic_max_features', {})
-            max_features_detailed = {
-                # 냉방/난방 강도 사용
-                '냉방강도': max(0.0, max_temp - 25.0),
-                '난방강도': max(0.0, 10.0 - min_temp),
-                '월': selected_month_detailed,
-                '어제의_최대수요': dyn.get('어제의_최대수요', 0.0),
-                '전주동일요일_최대수요': dyn.get('전주동일요일_최대수요', 0.0),
-                '작년동일요일_최대수요': dyn.get('작년동일요일_최대수요', 0.0),
-                # 계절별 추가 온도: 여름=최고기온 포함, 겨울=최저기온 포함
-                '최고기온': max_temp if is_summer_detailed else 0.0,
-                '최저기온': min_temp if is_winter_detailed else 0.0,
-                '체감온도': feels_like_detailed,
-                '일교차': max_temp - min_temp,
-            }
-            max_features_detailed.update(weekday_dummies_detailed)
-            
-            # 단일 모델 선택 후 피처 정렬/보정
-            model_max_detailed = rf_max
-            max_input_detailed = pd.DataFrame([max_features_detailed])
-            max_input_detailed = align_features_for_model(model_max_detailed, max_input_detailed)
-            
-            # 예측 실행
-            predicted_max_detailed = model_max_detailed.predict(max_input_detailed)[0]
-            
-            st.success("✅ 상세 예측 완료!")
-            
-            # 예측 결과 표시
-            st.subheader("🎯 상세 예측 결과")
-            
-            st.metric("예측 최대수요", f"{predicted_max_detailed:,.0f} MW")
-            
-            # 예측 결과 상세 정보
-            st.subheader("📋 상세 예측 상세 정보")
-            prediction_info_detailed = pd.DataFrame({
-                '항목': ['요일', '최저기온', '최고기온', '체감온도', '월', '예측 최대수요'],
-                '값': [selected_weekday_detailed, f"{min_temp}°C", f"{max_temp}°C", f"{feels_like_detailed:.1f}°C", f"{selected_month_detailed}월", 
-                      f"{predicted_max_detailed:,.0f} MW"]
-            })
-            st.dataframe(prediction_info_detailed, use_container_width=True)
-            
-            # 예측 신뢰도 (모델 성능 기반)
-            confidence_max_detailed = min(95, max(60, st.session_state.r2_max * 100))
-            
-            st.subheader("📊 상세 예측 신뢰도")
-            st.metric("최대수요 예측 신뢰도", f"{confidence_max_detailed:.1f}%")
-            
-            # 상세 예측 결과 시각화
-            st.subheader("📈 상세 예측 결과 시각화")
-            
-            fig_prediction_detailed = go.Figure()
-            
-            # 최대수요만 막대 그래프로 표시
-            fig_prediction_detailed.add_trace(go.Bar(
-                x=['최대수요'],
-                y=[predicted_max_detailed],
-                name='상세 예측 최대수요',
-                marker_color=['red']
-            ))
-            
-            fig_prediction_detailed.update_layout(
-                title=f"{selected_weekday_detailed} (최저:{min_temp}°C, 최고:{max_temp}°C) 최대수요 예측",
-                yaxis_title="전력 수요 (MW)",
-                showlegend=True
-            )
-            
-            st.plotly_chart(fig_prediction_detailed, use_container_width=True)
-            
-
-            
-    except Exception as e:
-        st.error(f"❌ 상세 예측 중 오류가 발생했습니다: {str(e)}")
-        st.info("모델 학습이 완료되지 않았거나 입력 데이터에 문제가 있을 수 있습니다.")
 
 # --- 날짜 기반 예측 ---
 st.markdown("---")
@@ -1861,7 +1605,7 @@ if submit_date_forecast:
                             is_business_day_flag = sheet_weekday
             except Exception:
                 pass
-            # 모델 입력용 단순 플래그
+            # 모델 입력용 단순 플래그 (평일_평일 제거에 따라 더미에서만 사용)
             is_weekday_flag = is_business_day_flag
 
             # 래그 계산: 과거 관측에서 추출
@@ -1912,7 +1656,6 @@ if submit_date_forecast:
                 '최저기온': (min_temp_val if min_temp_val is not None else feels_like_val) if is_winter else 0.0,
                 '체감온도': feels_like_val,
                 '일교차': ( (max_temp_val - min_temp_val) if (max_temp_val is not None and min_temp_val is not None) else 0.0 ),
-                '평일_평일': int(is_weekday_flag),
             }
             feature_row.update({f'요일_{w}': (1 if w == weekday_name else 0) for w in ['월요일','화요일','수요일','목요일','금요일','토요일','일요일']})
 
@@ -1984,9 +1727,16 @@ if hasattr(st.session_state, 'gas_model'):
     with col1:
         st.subheader("📝 가스수요 예측 조건 입력")
         
-        # 요일 선택 (평일/주말 반영)
+        # 요일 선택 + 한국 공휴일/업무일 판정
         gas_weekday = st.selectbox("요일 선택", ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일'], index=0, key="gas_weekday")
-        gas_is_weekday = 1 if gas_weekday in ['월요일', '화요일', '수요일', '목요일', '금요일'] else 0
+        gas_date_for_flag = st.date_input("예측 기준 날짜(업무일/공휴일 판정)", value=pd.Timestamp.today().date(), key="gas_date_flag")
+        try:
+            kr_holidays = holidays.KR()
+        except Exception:
+            kr_holidays = {}
+        gas_is_holiday = 1 if gas_date_for_flag in kr_holidays else 0
+        gas_weekday_num = ['월요일','화요일','수요일','목요일','금요일','토요일','일요일'].index(gas_weekday)
+        gas_is_business = 1 if (gas_weekday_num < 5 and gas_is_holiday == 0) else 0
 
         # 최대수요 입력
         max_demand_input = st.number_input(
@@ -2011,7 +1761,9 @@ if hasattr(st.session_state, 'gas_model'):
     
     with col2:
         st.subheader("📊 가스수요 입력 정보")
-        st.write(f"**요일:** {gas_weekday} ({'평일' if gas_is_weekday else '주말'})")
+        st.write(f"**요일:** {gas_weekday}")
+        st.write(f"**공휴일:** {'예' if gas_is_holiday else '아니오'}")
+        st.write(f"**업무일:** {'예' if gas_is_business else '아니오'}")
         st.write(f"**최대수요:** {max_demand_input:,.0f} MW")
         st.write(f"**태양광최대:** {solar_max_input:,.0f} MW")
     
@@ -2046,10 +1798,11 @@ if hasattr(st.session_state, 'gas_model'):
                     '잔여부하': residual_load_input,
                     '최대수요대비_태양광비율': solar_ratio_total,
                     '최대수요대비_잔여부하비율': residual_ratio_total,
-                    '목표가스_예산': max_demand_input * (st.session_state.get('gas_total_ratio_weekday', 0.0) if gas_is_weekday else st.session_state.get('gas_total_ratio_weekend', 0.0)) - solar_max_input,
+                    '목표가스_예산': max_demand_input * (st.session_state.get('gas_total_ratio_weekday', 0.0) if gas_is_business else st.session_state.get('gas_total_ratio_weekend', 0.0)) - solar_max_input,
                     '어제의_가스수요': last_gas if last_gas is not None else 0.0,
                     '어제의_가스수요_변화율': gas_rate,
-                    '평일_평일': float(gas_is_weekday),
+                    '업무일': float(gas_is_business),
+                    '공휴일': float(gas_is_holiday),
                 })
 
                 prediction_input_gas = pd.DataFrame([input_dict])

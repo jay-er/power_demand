@@ -1,100 +1,84 @@
 # ⚡ 전력 수요 예측 시스템
 
-Streamlit을 사용한 전력 수요 예측 웹 애플리케이션입니다.
+Streamlit 기반의 전력/가스 수요 예측 웹 애플리케이션입니다. Google Sheets와 연동해 데이터를 로딩·편집하고, RandomForest/LightGBM 모델로 예측하며, Step 0~6 단계형 UI로 작업 흐름을 제공합니다.
 
 ## 🚀 주요 기능
 
-- **구글 시트 연동**: 실시간 데이터 로딩 및 편집
-- **머신러닝 예측**: Random Forest를 사용한 최대수요 예측
-- **인터랙티브 시각화**: Plotly를 활용한 동적 차트
-- **데이터 편집**: 웹 인터페이스를 통한 실시간 데이터 수정
+- **Google Sheets 연동**: 자동 로딩, 인라인 편집, 변경분만 업데이트
+- **머신러닝 예측**:
+  - 최대수요: RandomForestRegressor
+  - 가스수요: LightGBM (단일 모델)
+- **모델 성능 평가**: MAE, R² 지표 (Step 5 익스팬더 내부에서 출력)
+- **예측 실행**: 날짜 기반/입력 기반 폼으로 예측 및 결과 시각화
+- **전역 로딩 배너**: Step 4~5 진행 시 상단 배너로 상태 표시
+
+## 🧭 UI 단계(Flow)
+
+- Step 0: 데이터 로딩 및 편집 — `st.header("📁 Step 0: ...")`
+- Step 1: 데이터 준비 — `with st.expander("📋 Step 1: ...")`
+- Step 2: 특징 공학 및 데이터 정제 — `with st.expander("🔧 Step 2: ...")`
+- Step 3: 모델 변수 및 데이터 분리 — `with st.expander("🎯 Step 3: ...")`
+- Step 4: 모델 학습 — `with st.expander("🤖 Step 4: ...")`
+- Step 5: 모델 성능 평가 — `with st.expander("📊 Step 5: ...")`
+- Step 6: 전력 수요 예측 — 입력 폼 및 결과 표시
 
 ## 📋 설치 및 실행
 
-### 1. 필요한 라이브러리 설치
+### 1) 의존성 설치
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 구글 시트 연동 설정
+### 2) Google Sheets 연동 설정
 
-#### 방법 1: 환경변수 사용 (권장)
+- 서비스 계정 JSON 키를 환경변수로 제공 (권장)
+  - Windows PowerShell 예시:
+    ```powershell
+    $env:GOOGLE_CREDENTIALS_JSON='{"type":"service_account", ... }'
+    ```
+- 또는 코드 내 하드코딩(개발/테스트용 백업 경로) 사용
+- 시트 공유 설정: 서비스 계정 이메일을 대상 시트 공유자에 추가(편집 권한)
+- 시트 정보: 코드의 `sheet_name`, `sheet_id` 값 확인/수정
 
-1. **`.env` 파일 생성** (이미 생성됨)
-   ```bash
-   # .env 파일에 Google 서비스 계정 JSON 키 설정
-   GOOGLE_CREDENTIALS_JSON={"type":"service_account",...}
-   ```
-
-2. **환경변수 직접 설정** (Windows PowerShell)
-   ```powershell
-   $env:GOOGLE_CREDENTIALS_JSON='{"type":"service_account",...}'
-   ```
-
-#### 방법 2: 하드코딩 (백업 옵션)
-
-환경변수가 설정되지 않은 경우 자동으로 하드코딩된 값 사용
-
-### 3. 구글 시트 권한 설정
-
-1. **구글 시트 공유**: `firebase-adminsdk-fbsvc@test-92f50.iam.gserviceaccount.com`에게 편집자 권한 부여
-2. **시트 ID 확인**: `1xyL8hCNBtf7Xo5jyIFEdoNoVJWEMSkgxMZ4nUywSBH4`
-
-### 4. 애플리케이션 실행
+### 3) 애플리케이션 실행
 
 ```bash
 streamlit run streamlit_app.py
 ```
 
-## 🔧 인증 방식 비교
+## 🗂️ 데이터 형식(예)
 
-### 환경변수 방식 (권장)
-- **장점**: 보안성, 유연성, 안정성
-- **설정**: `.env` 파일 또는 시스템 환경변수
-- **우선순위**: 최고
+- `날짜` (YYYY-MM-DD)
+- `최대수요` 또는 `전력 수요` (MW)
+- `최고기온`, `평균기온`, `최저기온`, `체감온도`
+- 파생 변수: `태양광최대`, `잔여부하`, `최대수요대비_태양광비율`, `최대수요대비_잔여부하비율` 등
 
-### 하드코딩 방식 (백업)
-- **장점**: 간단한 설정
-- **단점**: 보안 위험, 코드 노출
-- **우선순위**: 환경변수 없을 때만 사용
+## 🤖 모델 및 지표
 
-## 📊 데이터 형식
+- 최대수요: RandomForestRegressor (간단 튜닝 포함)
+- 가스수요: LightGBM (단일 모델)
+- 평가 지표: MAE, R²
+- 모델 성능 출력: Step 5 익스팬더 내부에서 `st.metric`으로 표시
 
-필수 컬럼:
-- `날짜`: YYYY-MM-DD 형식
-- `최고기온`, `평균기온`, `최저기온`: 섭씨 온도
-- `최대수요`: MW 단위
-- `요일`: 요일명 (월요일, 화요일, ...)
-- `평일`: 평일 여부 (평일/주말)
+## 🔮 예측 기능
 
-## 🤖 예측 모델
-
-### 최대수요 예측 모델
-- **특징**: 최고기온, 평균기온, 월, 어제의_최대수요, 요일, 평일
-- **알고리즘**: Random Forest Regressor
-
-<!-- 최소(최저) 수요 예측 관련 내용은 제거되었습니다 -->
-
-## 📈 성능 평가
-
-- **MAE (Mean Absolute Error)**: 예측 오차의 절대값 평균
-- **R² (결정 계수)**: 모델의 설명력 (0~1, 높을수록 좋음)
-
-## 🔗 관련 링크
-
-- **기상청 기상자료개방포털**: https://data.kma.go.kr/stcs/grnd/grndTaList.do?pgmNo=70
-- **한국전력거래소**: https://www.kpx.or.kr/powerinfoSubmain.es?mid=a10606030000
+- Step 6에서 날짜 기반/입력 기반 예측 지원
+- 전역 진행 배너: Step 4 시작 시 표시, Step 5 종료 시 제거
 
 ## 🛠️ 기술 스택
 
-- **Frontend**: Streamlit
-- **Backend**: Python
-- **ML**: scikit-learn (Random Forest)
-- **Visualization**: Plotly
-- **Data Storage**: Google Sheets
-- **Authentication**: Google Service Account
+- Frontend/UI: Streamlit, Plotly
+- Data: Pandas, NumPy
+- ML: scikit-learn (RandomForest), LightGBM
+- Storage/Sync: Google Sheets (gspread, Google OAuth2)
+
+## 🧯 트러블슈팅
+
+- 인증/권한: `GOOGLE_CREDENTIALS_JSON` 설정 및 시트 공유 권한 확인
+- API 한도: 호출 제한 시 대기/재시도, 편집 변경분만 업데이트
+- 데이터: 날짜 파싱/결측 처리/필수 컬럼 검증
 
 ## 📝 라이선스
 
-MIT License 
+MIT License
